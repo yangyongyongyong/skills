@@ -9,7 +9,7 @@
 将本仓库克隆或复制到 `~/.cursor/skills/`：
 
 ```bash
-git clone https://github.com/your-username/cursor-skills ~/.cursor/skills
+git clone https://github.com/yangyongyongyong/skills ~/.cursor/skills
 ```
 
 若目录已存在，将各 Skill 子目录移入即可，Cursor 会自动发现。
