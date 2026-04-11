@@ -55,6 +55,8 @@ git clone https://github.com/yangyongyongyong/skills ~/.cursor/skills
 
 让 Cursor Agent 直接向 iTerm2 中已有的标签页（包括 SSH、docker exec 等远端会话）发送命令并取回输出，无需额外建立连接。
 
+![iterm2-exec skill 演示](assets/iterm2_skill.gif)
+
 #### 技术架构
 
 ```
