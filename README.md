@@ -4,13 +4,38 @@
 
 每个 Skill 是一个独立目录，包含一份 `SKILL.md`（Agent 行为指引）和可选的辅助脚本。Agent 会根据上下文自动判断是否触发对应 Skill。
 
-## 安装
+## 安装与使用
+
+Cursor、Codex、Claude Code 均支持相同的 SKILL.md 格式，使用步骤完全一致，**仅安装目录不同**：
+
+| 工具 | Skills 目录 |
+|------|------------|
+| [Cursor](https://cursor.com) | `~/.cursor/skills/` |
+| [Codex CLI](https://github.com/openai/codex) | `~/.codex/skills/` |
+| [Claude Code](https://docs.anthropic.com/claude/docs/claude-code) | `~/.claude/skills/` |
+
+将本仓库克隆到对应目录，工具启动后自动发现所有 Skill：
+
+```bash
+# Cursor
+git clone https://github.com/yangyongyongyong/skills ~/.cursor/skills
+
+# Codex
+git clone https://github.com/yangyongyongyong/skills ~/.codex/skills
+
+# Claude Code
+git clone https://github.com/yangyongyongyong/skills ~/.claude/skills
+```
+
+同时使用多个工具时，克隆一次后用软链接共享：
 
 ```bash
 git clone https://github.com/yangyongyongyong/skills ~/.cursor/skills
+ln -s ~/.cursor/skills ~/.codex/skills
+ln -s ~/.cursor/skills ~/.claude/skills
 ```
 
-若目录已存在，将各 Skill 子目录移入即可，Cursor 会自动发现。
+若目录已存在，将各 Skill 子目录移入即可。
 
 ---
 
