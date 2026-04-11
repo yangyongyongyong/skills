@@ -159,6 +159,19 @@ python3 -m venv ~/.cursor/skills/iterm2-exec/.venv
 chrome.exe --remote-debugging-port=9222
 ```
 
+**验证 CDP 是否已监听**（本机有进程在 `9222` 端口 LISTEN 即表示 CDP 已开启）：
+
+```bash
+lsof -nP -iTCP:9222 -sTCP:LISTEN
+```
+
+示例返回（有输出即正常；无输出表示尚未监听，需先按上文启动带调试端口的 Chrome）：
+
+```
+COMMAND     PID   USER   FD   TYPE             DEVICE SIZE/OFF NODE NAME
+Google    45231  alice  45u  IPv4 0x1234567890abcdef      0t0  TCP 127.0.0.1:9222 (LISTEN)
+```
+
 > **常见陷阱：`user-chrome-devtools` MCP 的多实例问题**
 >
 > `user-chrome-devtools` MCP 在 `mcp.json` 中未配置 `--browser-url=http://127.0.0.1:9222` 时，
