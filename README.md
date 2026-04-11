@@ -6,8 +6,6 @@
 
 ## 安装
 
-将本仓库克隆或复制到 `~/.cursor/skills/`：
-
 ```bash
 git clone https://github.com/yangyongyongyong/skills ~/.cursor/skills
 ```
@@ -20,43 +18,32 @@ git clone https://github.com/yangyongyongyong/skills ~/.cursor/skills
 
 ### `iterm2-exec` — 通过 iTerm2 在本机/远端会话执行命令
 
-**核心场景**：你已在 iTerm2 里打开了一个 SSH 会话连接到服务器，希望让 Cursor Agent 直接向该会话发送命令并取回输出——相当于让 Agent 操作线上环境，无需额外建立 SSH 连接。
+让 Cursor Agent 直接向 iTerm2 中已有的标签页（包括 SSH、docker exec 等远端会话）发送命令并取回输出，无需额外建立连接。
 
-**工作原理**：借助 [iTerm2 Python API](https://iterm2.com/python-api/) 连接本机运行中的 iTerm2，通过 Shell Integration 的 Prompt 元数据精确截取「本次命令」的输出区间，杜绝全屏抓取的噪声与歧义。
+**核心特性**：
 
-**支持的场景**：
+- **智能双模式**：自动探测目标会话是否安装了 iTerm2 Shell Integration
+  - 本地 shell（已装 SI）→ 纯 SI 模式：直发裸命令，`output_range` 精确截取，完全免疫 resize
+  - SSH / Docker / 未装 SI → 哨兵模式：不可见 Custom Escape Sequence 检测完成，远端只需有 `printf`，无需安装任何工具
+- **标签自动切换**：`--tab-num N` 对应 ⌘N，指定非当前标签会自动切过去
+- **阻塞保护**：超时自动发 `Ctrl+C`，shell 立即恢复
 
-| 场景 | 说明 |
-|------|------|
-| 默认 ⌘1 | 不传任何选择器，自动操作 iTerm2 第一个标签（⌘1） |
-| 按 ⌘N 编号 | `--tab-num 2` 即 ⌘2，与 iTerm2 快捷键一一对应，最直观 |
-| 按低级索引 | `--window-index` / `--tab-index` / `--split-index` 精确到某个分屏（0 起） |
-| 按 Session ID | `--session-id` 最精确，适合脚本固定绑定某个会话 |
-| 多行命令 | `for` 循环、`if` 语句等含 `\n` 的命令，自动转换为终端回车 |
-| 特殊字符 | 双引号、单引号、`$变量`、管道、反引号、中文/emoji 均可透传 |
-| JSON 输出 | `--json` 返回 `{ stdout, session_id }` 结构，方便 Agent 解析 |
-| 阻塞命令识别 | 超时（`--timeout-seconds`）后自动发送 `Ctrl+C`，shell 立即恢复可用 |
-| SSH 远端操作 | 目标会话已 SSH 到服务器时，命令在远端执行，输出返回本地 |
-
-**前置要求**：
-
-- macOS，iTerm2 已运行并在 Preferences → General → Magic 中开启 **Python API**
-- 目标会话（本机或 SSH 远端）已安装 [iTerm2 Shell Integration](https://iterm2.com/documentation-shell-integration.html)
+**前置要求**：macOS，iTerm2 已运行并开启 Python API（Preferences → General → Magic）。
 
 **快速开始**：
 
 ```bash
-# 1. 创建虚拟环境并安装依赖（仅首次）
+# 安装依赖（仅首次）
 python3 -m venv ~/.cursor/skills/iterm2-exec/.venv
 ~/.cursor/skills/iterm2-exec/.venv/bin/pip install iterm2
 
-# 2. 验证
+# 向默认标签（⌘1）发命令
 ~/.cursor/skills/iterm2-exec/.venv/bin/python \
   ~/.cursor/skills/iterm2-exec/scripts/iterm2_exec.py run \
   --command 'echo OK'
 ```
 
-**局限**：输出通过 prompt 区间截取，不等价于远端进程的真实 exit code；无 Shell Integration 时直接报错而非降级为全屏抓取。
+完整参数说明、执行模式细节、故障排查见 [`iterm2-exec/SKILL.md`](iterm2-exec/SKILL.md)。
 
 ---
 
@@ -64,7 +51,7 @@ python3 -m venv ~/.cursor/skills/iterm2-exec/.venv
 
 ```
 ~/.cursor/skills/
-├── README.md                 # 本文件
+├── README.md
 └── iterm2-exec/
     ├── SKILL.md              # Agent 触发规则、调用示例、安全约束
     └── scripts/
@@ -73,14 +60,14 @@ python3 -m venv ~/.cursor/skills/iterm2-exec/.venv
 
 ---
 
-## 贡献 / 添加新 Skill
+## 添加新 Skill
 
-1. 在本目录新建子目录，名称用 `kebab-case`。
-2. 在其中创建 `SKILL.md`，frontmatter 包含 `name` 与 `description`。
-3. 将辅助脚本放在 `scripts/` 子目录。
-4. 更新本 README 的「Skills 一览」表格。
+1. 新建 `kebab-case` 命名的子目录。
+2. 创建 `SKILL.md`，frontmatter 包含 `name` 与 `description`。
+3. 辅助脚本放在 `scripts/` 子目录。
+4. 更新本 README 的「Skills 一览」。
 
-Cursor Skill 格式参考：[Agent Skills 文档](https://cursor.com/docs/skills)。
+格式参考：[Cursor Agent Skills 文档](https://cursor.com/docs/skills)。
 
 ---
 
