@@ -105,6 +105,8 @@ python3 -m venv ~/.cursor/skills/iterm2-exec/.venv
 
 让 Cursor Agent 直接向任意 JupyterLab Terminal 发送命令并实时取回输出，兼容本地、远程域名等各种部署方式，速度比浏览器截图方式快 10 倍以上。
 
+![jupyterlab-terminal skill 演示](assets/jupyter_skill.gif)
+
 #### 技术架构
 
 ```
