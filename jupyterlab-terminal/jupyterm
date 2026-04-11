@@ -1,0 +1,3 @@
+#!/bin/bash
+# 快速入口脚本——直接调用 jupyterm.py
+exec python3 "$(dirname "$0")/jupyterm.py" "$@"
