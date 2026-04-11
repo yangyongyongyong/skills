@@ -148,11 +148,12 @@ python3 -m venv ~/.cursor/skills/iterm2-exec/.venv
 
 `jupyterm setup` 通过 HTTP 直接访问 Chrome CDP 端口（`http://127.0.0.1:9222/json`）读取标签页信息，不借助任何 MCP，不会启动新浏览器实例。
 
-**浏览器版本说明**：`--remote-debugging-port` 与 CDP 的 `/json` 列表端点是 Chromium 长期内置能力，**并非近几年才新增**；Google 官方文档也未给出「必须高于某具体小版本」的硬性下限。实践中请使用**当前仍在支持周期的 Chrome 稳定版**（或同内核的 Edge / Brave 等，命令行参数可能略有差异）。过旧、已停止安全更新的浏览器可能缺少后续 CDP 字段或行为不一致，不建议用于本工作流。
+**浏览器与远程调试说明**（以官方为准：[Chrome DevTools MCP：调试浏览器会话](https://developer.chrome.com/blog/chrome-devtools-mcp-debug-your-browser-session?hl=zh-cn)）：
 
-`chrome://inspect/#devices` 页面主要用于 **USB 调试 Android 设备**等场景；桌面端最稳妥的方式仍是**用调试端口启动浏览器**（见下）。若你习惯在 `chrome://inspect` 里配置「发现网络目标」，可与命令行方式二选一或配合使用。
+- **Chrome 144（M144）及以上**：在地址栏打开 **`chrome://inspect/#remote-debugging`**，按页面提示**显式允许**远程调试连接。自 M144 起，Chrome 默认**关闭**远程调试，需在该页打开后才能被外部客户端（含本 Skill 使用的 CDP HTTP）连接；这与 **`chrome://inspect/#devices`**（主要用于 USB 调试 Android 设备）**不是同一入口**，不要混用。
+- **任意版本（通用做法）**：用命令行带 **`--remote-debugging-port=9222`** 启动 Chrome（见下）。只要本机 `9222` 处于 LISTEN（见下文 `lsof`），`jupyterm setup` 即可通过 `http://127.0.0.1:9222/json` 读取标签页。
 
-在 Chrome 地址栏访问 `chrome://inspect/#devices` 勾选远程调试，或以调试端口启动：
+请使用**当前受支持**的 Chrome 稳定版；过旧版本可能缺少 M144 的 `#remote-debugging` 页面或与 CDP 行为不一致。
 
 ```bash
 # macOS

@@ -389,9 +389,9 @@ def cmd_setup(args):
 
     else:  # no_cdp
         print("[jupyterm] 未发现任何 Chrome CDP 实例。", file=sys.stderr)
-        print("[jupyterm] 请确认 Chrome 已开启远程调试，方法之一：", file=sys.stderr)
-        print("  chrome://inspect/#devices → 勾选 Discover network targets", file=sys.stderr)
-        print("  或启动 Chrome 时加参数：--remote-debugging-port=9222", file=sys.stderr)
+        print("[jupyterm] 请确认 Chrome 已开启远程调试，任选其一：", file=sys.stderr)
+        print("  Chrome 144+：chrome://inspect/#remote-debugging（按页面允许连接）", file=sys.stderr)
+        print("  任意版本：启动 Chrome 时加 --remote-debugging-port=9222", file=sys.stderr)
         print("[jupyterm] 也可手动指定：jupyterm setup --url <url> --token <token>", file=sys.stderr)
         sys.exit(1)
 
