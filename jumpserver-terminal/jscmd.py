@@ -690,10 +690,8 @@ class JscmdDaemon:
         self._interpreter_mode: dict = {}
         # 全局 exec 串行锁：防止并发 exec 竞争 _net_events 队列和全局输入焦点
         self._exec_lock: asyncio.Lock = asyncio.Lock()
-        # refresh 串行锁：防止 _watch_new_tabs 和 exec 同时触发 refresh_contexts 互相干扰
+        # refresh 串行锁：防止并发 refresh_contexts 互相干扰
         self._refresh_lock: asyncio.Lock = asyncio.Lock()
-        # refresh 进行中标志：_watch_new_tabs 在此期间忽略 context 事件，避免循环触发
-        self._refreshing: bool = False
 
     def _nid(self) -> int:
         """生成递增消息 id。
@@ -976,20 +974,6 @@ class JscmdDaemon:
     async def _do_refresh_contexts(self):
         """refresh_contexts 的实际实现，由 _refresh_lock 保护。
 
-        设置 _refreshing 标志防止 _watch_new_tabs 在此期间
-        因 Runtime.disable/enable 产生的 context 事件而循环触发 refresh。
-
-        @return none
-        """
-        self._refreshing = True
-        try:
-            await self.__refresh_impl()
-        finally:
-            self._refreshing = False
-
-    async def __refresh_impl(self):
-        """refresh 的核心逻辑，被 _do_refresh_contexts 包装。
-
         @return none
         """
         if self._disp is None:
@@ -1089,21 +1073,74 @@ class JscmdDaemon:
 
         @return 活跃标签的 0-based 索引，未找到返回 0
         """
+        info = await self._live_tab_info()
+        for item in info:
+            if item.get("active"):
+                return item["idx"]
+        return 0
+
+    async def _live_tab_info(self) -> list:
+        """实时查询 DOM 中 KoKo iframe 列表，不使用任何缓存。
+
+        返回 [{idx, src, active, contextId}, ...]，按 DOM 顺序。
+        contextId 通过 Runtime.executionContextCreated 事件匹配 frameId 获取。
+        若无法获取 contextId 则该字段为 None（仍可用于 tab 数量和 active 检测）。
+
+        @return KoKo iframe 信息列表
+        """
         js = """JSON.stringify(
           Array.from(document.querySelectorAll('iframe'))
                .filter(f=>f.src.includes('/koko/connect/'))
-               .map((f,idx)=>({idx:idx,active:f.offsetWidth>0})))"""
+               .map((f,idx)=>({idx:idx, src:f.src, active:f.offsetWidth>0})))"""
         result = await self._eval(js, 0, timeout=5.0)
         if not result:
-            return 0
+            return []
         try:
             items = json.loads(result)
-            for item in items:
-                if item.get("active"):
-                    return item["idx"]
         except Exception:
-            pass
-        return 0
+            return []
+
+        # 尝试为每个 iframe 匹配 execution context ID
+        # 从缓存的 iframe_contexts 里按 src 匹配（token 截断匹配）
+        for item in items:
+            item["contextId"] = None
+            src = item.get("src", "")
+            for ctx_id, ctx_src in self.iframe_contexts:
+                if src[:80] in ctx_src or ctx_src[:80] in src:
+                    item["contextId"] = ctx_id
+                    break
+        return items
+
+    async def get_tab_context(self, tab_idx: int) -> int:
+        """获取指定 tab 的 execution context ID，实时验证。
+
+        先从缓存匹配，匹配不到则执行一次 refresh_contexts 后重试。
+
+        @param[in] tab_idx 0-based 标签索引
+        @return context ID，获取失败返回 None
+        """
+        info = await self._live_tab_info()
+        if tab_idx >= len(info):
+            return None
+        ctx_id = info[tab_idx].get("contextId")
+        if ctx_id is not None:
+            return ctx_id
+        # 缓存中没匹配到，刷新一次 context 列表
+        print(f"[daemon] tab #{tab_idx + 1} 无缓存 context ID，刷新...",
+              file=sys.stderr)
+        await self.refresh_contexts()
+        # 重新匹配
+        info = await self._live_tab_info()
+        if tab_idx < len(info):
+            return info[tab_idx].get("contextId")
+        return None
+
+    def get_live_tab_count_sync(self) -> int:
+        """同步获取缓存的 tab 数量（仅用于 status 等无需精确的场景）。
+
+        @return 缓存中的 tab 数量
+        """
+        return len(self.iframe_contexts)
 
     def _msg(self, method: str, params: dict) -> dict:
         """构建带 session_id 的 CDP 消息 dict。
@@ -1343,37 +1380,40 @@ class JscmdDaemon:
         @param[in] timeout  等待输出的超时秒数
         @return 命令输出（已剥离 ANSI 转义），超时时返回已收到的部分输出并标注
         """
-        if tab_idx >= len(self.iframe_contexts):
-            # tab 不存在时先刷新（可能浏览器新开了标签或 Luna session 失效）
-            print(f"[daemon] 标签 #{tab_idx + 1} 不在缓存中"
-                  f"（共 {len(self.iframe_contexts)} 个），自动刷新...",
-                  file=sys.stderr)
+        # 实时查 DOM：确认 tab 存在 + 获取 context ID，不依赖缓存
+        live_info = await self._live_tab_info()
+        if tab_idx >= len(live_info):
+            return (f"[ERROR] 标签 #{tab_idx + 1} 不存在"
+                    f"（浏览器中当前 {len(live_info)} 个终端），"
+                    f"请确认浏览器中已打开对应终端")
+
+        ctx_id = live_info[tab_idx].get("contextId")
+        if ctx_id is None:
+            # 缓存无匹配，刷新 context 列表后重试
             await self.refresh_contexts()
-            if tab_idx >= len(self.iframe_contexts):
-                return (f"[ERROR] 标签 #{tab_idx + 1} 不存在"
-                        f"（共 {len(self.iframe_contexts)} 个标签），"
-                        f"请确认浏览器中已打开对应终端")
+            live_info = await self._live_tab_info()
+            if tab_idx < len(live_info):
+                ctx_id = live_info[tab_idx].get("contextId")
+            if ctx_id is None:
+                return (f"[ERROR] 标签 #{tab_idx + 1} 无法获取 context ID，"
+                        f"请重启 daemon 后重试")
 
         # 串行锁：防止并发 exec 竞争全局输入焦点和 _net_events 队列
-        # 等锁最多比命令超时多 5s，超时则报错而非无限等待
         try:
             await asyncio.wait_for(self._exec_lock.acquire(), timeout=timeout + 5)
         except asyncio.TimeoutError:
             return "[ERROR] 另一条命令正在执行中，请稍后重试"
         try:
-            # 检查当前活跃标签，不一致时才切换，避免不必要的 UI 操作
+            # 检查当前活跃标签，不一致时才切换
             active_idx = await self.detect_active_tab()
             if active_idx != tab_idx:
                 print(f"[daemon] 当前活跃 #{active_idx + 1}，切换到 #{tab_idx + 1}", file=sys.stderr)
                 await self._switch_to_tab(tab_idx)
-                # 验证切换结果，最多重试一次
                 active_after = await self.detect_active_tab()
                 if active_after != tab_idx:
                     print(f"[daemon] 警告：切换后活跃标签仍为 #{active_after + 1}，再等待 0.5s",
                           file=sys.stderr)
                     await asyncio.sleep(0.5)
-
-            ctx_id = self.iframe_contexts[tab_idx][0]
             sentinel = f"__JSCMD_{uuid.uuid4().hex[:12]}__"
 
             # 读取当前标签的解释器模式
@@ -1719,17 +1759,17 @@ class JscmdDaemon:
         }
 
     async def list_tabs(self) -> list:
-        """列出所有终端标签的状态信息。
+        """列出所有终端标签的状态信息，实时查 DOM。
 
-        @return [{idx, active}, ...] 列表
+        @return [{idx, active, context_id}, ...] 列表
         """
-        active_idx = await self.detect_active_tab()
+        live = await self._live_tab_info()
         result = []
-        for i, (ctx_id, src) in enumerate(self.iframe_contexts):
+        for item in live:
             result.append({
-                "idx": i + 1,
-                "context_id": ctx_id,
-                "active": (i == active_idx),
+                "idx": item["idx"] + 1,
+                "context_id": item.get("contextId"),
+                "active": item.get("active", False),
             })
         return result
 
@@ -1742,7 +1782,8 @@ class JscmdDaemon:
         cmd = req.get("cmd", "")
 
         if cmd == "ping":
-            return {"ok": True, "tabs": len(self.iframe_contexts)}
+            live = await self._live_tab_info()
+            return {"ok": True, "tabs": len(live)}
 
         if cmd == "list":
             tabs = await self.list_tabs()
@@ -1750,7 +1791,8 @@ class JscmdDaemon:
 
         if cmd == "refresh":
             await self.refresh_contexts()
-            return {"ok": True, "tabs": len(self.iframe_contexts)}
+            live = await self._live_tab_info()
+            return {"ok": True, "tabs": len(live)}
 
         if cmd == "exec":
             tab_idx = req.get("tab")   # 0-based，None=自动检测
@@ -1801,13 +1843,17 @@ class JscmdDaemon:
             if tab_idx is None:
                 tab_idx = await self.detect_active_tab()
 
-            if tab_idx >= len(self.iframe_contexts):
-                await self.refresh_contexts()
-            if tab_idx >= len(self.iframe_contexts):
+            live = await self._live_tab_info()
+            if tab_idx >= len(live):
                 return {"ok": False,
-                        "error": f"标签 #{tab_idx + 1} 不存在"}
+                        "error": f"标签 #{tab_idx + 1} 不存在（当前 {len(live)} 个）"}
 
-            ctx_id = self.iframe_contexts[tab_idx][0]
+            ctx_id = live[tab_idx].get("contextId")
+            if ctx_id is None:
+                ctx_id = await self.get_tab_context(tab_idx)
+            if ctx_id is None:
+                return {"ok": False,
+                        "error": f"标签 #{tab_idx + 1} 无法获取 context ID"}
             await self._switch_to_tab(tab_idx)
             await self._send_special_key(ctx_id, key_name)
             return {"ok": True, "key": key_name, "tab": tab_idx + 1}
@@ -1907,58 +1953,6 @@ class JscmdDaemon:
                     await self.reconnect()
                     fail_count = 0
 
-    async def _watch_new_tabs(self):
-        """后台任务：监听 Runtime.executionContextCreated 事件，实时感知新增 KoKo tab。
-
-        用户在 JumpServer 侧边栏打开新终端时，Luna 页面会动态插入新 iframe，
-        Chrome 会发出新的 executionContextCreated 事件。
-        本任务捕获后触发 refresh_contexts 全量刷新，无需重启 daemon 或手动刷新。
-
-        注意：dispatcher 支持多 queue 广播，此处注册不会影响 refresh_contexts 的监听。
-
-        @return none
-        """
-        _pending_refresh = False  # 防抖标志，短时间内多个事件只触发一次 refresh
-
-        while True:
-            if self._disp is None or not self._disp._running:
-                await asyncio.sleep(1)
-                continue
-
-            q: asyncio.Queue = asyncio.Queue()
-            self._disp.add_event_handler("Runtime.executionContextCreated", q)
-            try:
-                while True:
-                    try:
-                        msg = await asyncio.wait_for(q.get(), timeout=5.0)
-                    except asyncio.TimeoutError:
-                        if self._disp is None or not self._disp._running:
-                            break
-                        continue
-                    # refresh 进行中产生的 context 事件全部忽略，避免循环触发
-                    if self._refreshing or _pending_refresh:
-                        continue
-                    ctx = msg.get("params", {}).get("context", {})
-                    if (ctx.get("name", "") == "" and
-                            ctx.get("auxData", {}).get("frameId") != self.luna_target_id):
-                        ctx_id = ctx.get("id")
-                        existing_ids = {c[0] for c in self.iframe_contexts}
-                        if ctx_id not in existing_ids:
-                            _pending_refresh = True
-                            await asyncio.sleep(1.0)
-                            _pending_refresh = False
-                            if self._refreshing:
-                                continue
-                            prev_count = len(self.iframe_contexts)
-                            await self.refresh_contexts()
-                            if len(self.iframe_contexts) != prev_count:
-                                print(f"[daemon] 标签数变化: {prev_count} → "
-                                      f"{len(self.iframe_contexts)} 个 KoKo 终端标签",
-                                      file=sys.stderr)
-            finally:
-                self._disp.remove_event_handler("Runtime.executionContextCreated", q)
-            await asyncio.sleep(1)
-
     async def _idle_checker(self):
         """后台空闲检测任务：每 5 分钟检查一次，超过阈值则自动退出。
 
@@ -2009,10 +2003,9 @@ class JscmdDaemon:
         server = await asyncio.start_unix_server(
             self._handle_client, path=DAEMON_SOCK)
 
-        # 启动后台任务：空闲检测 + CDP 心跳 + 新标签实时监听
+        # 启动后台任务：空闲检测 + CDP 心跳
         asyncio.create_task(self._idle_checker())
         asyncio.create_task(self._heartbeat())
-        asyncio.create_task(self._watch_new_tabs())
 
         print(f"[daemon] 监听 Unix socket: {DAEMON_SOCK}", file=sys.stderr)
         async with server:
