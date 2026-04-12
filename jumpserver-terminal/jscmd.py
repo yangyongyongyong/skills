@@ -1818,6 +1818,53 @@ class JscmdDaemon:
                     await self.reconnect()
                     fail_count = 0
 
+    async def _watch_new_tabs(self):
+        """后台任务：监听 Runtime.executionContextCreated 事件，实时感知新增 KoKo tab。
+
+        用户在 JumpServer 侧边栏打开新终端时，Luna 页面会动态插入新 iframe，
+        Chrome 会发出新的 executionContextCreated 事件。
+        本任务捕获这些事件并把新 context 追加到 iframe_contexts 列表，
+        无需重启 daemon 或手动刷新。
+
+        @return none
+        """
+        while True:
+            if self._disp is None:
+                await asyncio.sleep(1)
+                continue
+
+            q: asyncio.Queue = asyncio.Queue()
+            self._disp.add_event_handler("Runtime.executionContextCreated", q)
+            try:
+                while True:
+                    try:
+                        msg = await asyncio.wait_for(q.get(), timeout=5.0)
+                    except asyncio.TimeoutError:
+                        # 检查 dispatcher 是否仍在运行
+                        if self._disp is None or not self._disp._running:
+                            break
+                        continue
+                    ctx = msg.get("params", {}).get("context", {})
+                    # 只关注无名（iframe内容）、非 Luna 主页面的 context
+                    if (ctx.get("name", "") == "" and
+                            ctx.get("auxData", {}).get("frameId") != self.luna_target_id):
+                        ctx_id = ctx.get("id")
+                        existing_ids = {c.get("id") for c in self.iframe_contexts}
+                        if ctx_id not in existing_ids:
+                            # 延迟一小会儿等 iframe src 写入 DOM
+                            await asyncio.sleep(0.3)
+                            # 重新用 _order_contexts 确认是 KoKo frame 并排序
+                            candidates = self.iframe_contexts + [ctx]
+                            ordered = await self._order_contexts(candidates)
+                            if len(ordered) > len(self.iframe_contexts):
+                                self.iframe_contexts = ordered
+                                print(f"[daemon] 检测到新标签，当前共 "
+                                      f"{len(self.iframe_contexts)} 个 KoKo 终端标签",
+                                      file=sys.stderr)
+            finally:
+                self._disp.remove_event_handler("Runtime.executionContextCreated")
+            await asyncio.sleep(1)
+
     async def _idle_checker(self):
         """后台空闲检测任务：每 5 分钟检查一次，超过阈值则自动退出。
 
@@ -1868,9 +1915,10 @@ class JscmdDaemon:
         server = await asyncio.start_unix_server(
             self._handle_client, path=DAEMON_SOCK)
 
-        # 启动后台任务：空闲检测 + CDP 心跳
+        # 启动后台任务：空闲检测 + CDP 心跳 + 新标签实时监听
         asyncio.create_task(self._idle_checker())
         asyncio.create_task(self._heartbeat())
+        asyncio.create_task(self._watch_new_tabs())
 
         print(f"[daemon] 监听 Unix socket: {DAEMON_SOCK}", file=sys.stderr)
         async with server:
