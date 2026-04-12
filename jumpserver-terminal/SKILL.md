@@ -127,6 +127,8 @@ jscmd connect "slow-server" --tab-wait 15
 
 打开后会自动检测 hostname，可用 `jscmd list` 查看新标签。
 
+`connect` 判定「新标签出现」依赖 **Luna 页面上 KoKo iframe 个数增加**，与 shell 登录提示符出现时机无关；iframe 出现后 CDP 再附着终端上下文，若仍超时见下表「connect 超时」。
+
 ### 解释器模式
 
 进入 Python/Node.js 等子解释器时，切换模式以正确处理哨兵和输出：
@@ -254,6 +256,19 @@ print(js_exec("@web ps aux"))
 
 ---
 
+## 并发执行说明
+
+多个 `exec` 命令同时发往 daemon 时，**daemon 侧串行处理**（后到的命令排队等待），这是预期行为，可防止以下问题：
+
+- 两个命令竞争 Chrome 全局输入焦点，导致内容被打到同一个 terminal
+- 两个命令竞争同一个网络事件队列，导致 sentinel 互相"偷"，引发超时
+
+`connect` 命令与 `exec` 也是互斥的：`connect` 在打开新标签后需要刷新 context 列表（`Runtime.disable/enable`），该操作会短暂中断 Network 事件推送。daemon 会在无进行中的 `exec` 时才执行刷新，防止正在收集输出的 exec 丢帧超时。
+
+CLI 层（Shell 工具调用）仍可并发发起，daemon 自动排队、按序执行、各自返回正确输出。
+
+---
+
 ## 故障排查
 
 | 问题 | 解决方法 |
@@ -262,5 +277,8 @@ print(js_exec("@web ps aux"))
 | Chrome 弹框后执行失败 | 确认在 Chrome 中点击了"允许" |
 | 未找到 JumpServer 页面 | 确认浏览器已打开 JumpServer（URL 含 `/luna/`） |
 | `DevToolsActivePort` 不存在 | 打开 `chrome://inspect/#remote-debugging` 启用远程调试 |
+| 命令超时无输出（`[TIMEOUT] 部分输出:`） | 多为并发 exec 竞争旧版本 bug；升级后已修复。若仍出现可增加 `--timeout` 或重启 daemon |
 | 命令输出为空 | 适当增加 `--timeout`（默认 30s）|
+| 多个命令都打到了同一个 tab | 旧版本并发 bug，升级后已修复；确认使用最新 `jscmd.py` |
 | `@name` 找不到标签 | 先执行 `jscmd sessions` 确认 hostname 已检测 |
+| `connect` 等待新终端超时 | 先确认侧栏能搜到资产且双击能打开终端。若刚关过标签仍失败，可 `jscmd daemon stop` 后重启 daemon 同步状态；仍不行则你的 Luna 可能在**同一 iframe 内切换会话**而非新增 iframe，需改自动化策略。 |

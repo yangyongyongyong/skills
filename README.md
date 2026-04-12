@@ -225,6 +225,113 @@ $JUPYTERM create
 
 完整参数说明、Agent 使用规范与注意事项见 [`jupyterlab-terminal/SKILL.md`](jupyterlab-terminal/SKILL.md)。
 
+### `jumpserver-terminal` — 通过浏览器 CDP 操作 JumpServer Web 终端
+
+让 Cursor Agent 直接向浏览器中打开的 JumpServer Web 终端发送命令并取回输出，无需 SSH 密钥，无需在服务器上安装任何工具，Agent 看到的就是终端的实际输出。
+
+![jumpserver-terminal skill 演示](assets/jumpserver_skill.gif)
+
+#### 能力一览
+
+| 功能 | 示例 |
+|------|------|
+| 在指定终端标签执行命令 | `#2 df -h` |
+| 搜索并自动打开服务器终端 | `jscmd connect web-01` |
+| 多行脚本 | 命令中含 `\n`，逐行发送 |
+| 交互式解释器（Python/Node/Ruby） | 进入 python 后继续执行 Python 代码 |
+| 发送控制键 | `jscmd send-key ctrl-c` |
+| 服务器别名管理 | `jscmd alias web-01 prod-web` |
+| 危险命令拦截 | `rm -rf /` 直接阻止；删除命令强制延迟确认 |
+
+#### 技术架构
+
+```
+┌───────────────────────────────────────────────────────────────────┐
+│  Cursor Agent                                                     │
+│    jscmd.py exec "#2 pwd"                                         │
+└───────────────────────────┬───────────────────────────────────────┘
+                            │ Unix socket（~/.jscmd.sock）
+                            ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  jscmd daemon（后台常驻，1h 空闲自动退出）                         │
+│                                                                   │
+│  • 维持唯一的 Chrome CDP WebSocket 连接（Chrome 弹框只出现一次）   │
+│  • 每 25s 发 Browser.getVersion 心跳，防止连接被空闲关闭          │
+│  • 接收 CLI 请求 → 切换 Luna UI 标签 → 发命令 → 返回输出          │
+└───────────────────────────┬───────────────────────────────────────┘
+                            │ Chrome DevTools Protocol（WebSocket）
+                            ▼
+┌───────────────────────────────────────────────────────────────────┐
+│  Chrome ──── JumpServer Luna（/luna/）                            │
+│               ├── KoKo iframe #1  xterm.js ← Input.insertText    │
+│               ├── KoKo iframe #2  xterm.js                       │
+│               └── KoKo iframe #N  xterm.js                       │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+**输出采集原理**：在命令末尾追加唯一哨兵（`printf 'SENTINEL'`），通过 `Network.webSocketFrameReceived` 持续监听 xterm.js 的 WebSocket 数据流，直到哨兵出现，剥离 ANSI 转义码后返回干净文本。
+
+#### 前置条件
+
+1. **macOS + Chrome 已开启远程调试**
+
+   打开 `chrome://inspect/#remote-debugging`，点击"开始远程调试"（或首次点击"允许"弹框）。验证：
+
+   ```bash
+   cat "~/Library/Application Support/Google/Chrome/DevToolsActivePort"
+   # 正常输出两行：端口号 + WebSocket 路径
+   ```
+
+2. **Chrome 中已打开 JumpServer**（URL 含 `/luna/`），且至少有一个终端标签处于连接状态。
+
+3. **安装依赖**（仅需 `websockets`）：
+
+   ```bash
+   cd ~/.cursor/skills/jumpserver-terminal
+   python3 -m venv .venv && source .venv/bin/activate
+   pip install websockets
+   ```
+
+#### 快速开始
+
+```bash
+JSCMD="~/.cursor/skills/jumpserver-terminal/.venv/bin/python3 \
+        ~/.cursor/skills/jumpserver-terminal/jscmd.py"
+
+# 启动后台 daemon（Chrome 弹「允许」弹框，点一次即可）
+$JSCMD daemon start
+
+# 在当前活跃终端执行命令
+$JSCMD exec "hostname"
+
+# 指定第 2 个标签（#2 / 2# / --tab 2 三种写法等价）
+$JSCMD exec "#2 df -h"
+
+# 搜索 JumpServer 资产列表，自动打开终端
+$JSCMD connect web-01
+
+# 查看当前所有标签及其 hostname
+$JSCMD list
+
+# 给服务器设别名（下次可用 @prod-web 替代完整名称）
+$JSCMD alias web-01 prod-web
+```
+
+**daemon 生命周期**：默认**永久常驻**，不会自动退出。若需限制空闲时长，可通过以下方式配置：
+
+```bash
+# 方式一：启动时指定（优先级最高）
+jscmd daemon start --idle-timeout 3600   # 1 小时无请求后自动退出
+jscmd daemon start --idle-timeout 0      # 明确指定永久常驻
+
+# 方式二：写入配置文件（对后续每次启动生效）
+# ~/.jscmd_config.json 中设置 "idle_timeout_seconds": 3600
+```
+
+`exec`/`connect` 命令在 daemon 未运行时会自动重启 daemon（仍需在 Chrome 弹框中点击"允许"一次）。Chrome 弹框只与 daemon 启动绑定，daemon 运行期间不会再次弹出。
+
+完整命令参考与 Agent 调用规范见 [`jumpserver-terminal/SKILL.md`](jumpserver-terminal/SKILL.md)。
+
 ---
 
 ## 目录结构
@@ -235,11 +342,14 @@ $JUPYTERM create
 ├── iterm2-exec/
 │   ├── SKILL.md              # Agent 触发规则、调用示例、安全约束
 │   └── scripts/
-│       └── iterm2_exec.py    # CLI 实现（单文件，基于 iTerm2 Python API）
-└── jupyterlab-terminal/
-    ├── SKILL.md              # Agent 触发规则、调用示例、注意事项
-    ├── jupyterm              # bash wrapper（直接执行）
-    └── jupyterm.py           # Python 实现（WebSocket + JupyterLab API）
+│       └── iterm2_exec.py    # CLI 实现（基于 iTerm2 Python API）
+├── jupyterlab-terminal/
+│   ├── SKILL.md              # Agent 触发规则、调用示例、注意事项
+│   ├── jupyterm              # bash wrapper
+│   └── jupyterm.py           # Python 实现（WebSocket + JupyterLab API）
+└── jumpserver-terminal/
+    ├── SKILL.md              # Agent 触发规则、命令参考、安全约束
+    └── jscmd.py              # CLI + daemon 实现（Chrome CDP + Unix socket）
 ```
 
 ---

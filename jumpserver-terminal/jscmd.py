@@ -9,12 +9,6 @@ jscmd — 通过 Chrome CDP 与 JumpServer Web 终端交互的 CLI 工具。
   jscmd list                      # 列出所有 JumpServer 终端标签
   jscmd exec "ls -la"             # 在活跃 terminal 执行
   jscmd exec "#2 ls -la"         # 在第 2 个标签执行（#N 或 N# 语法）
-  jscmd exec "@web ls -la"       # 按 hostname/别名 定位标签执行
-  jscmd sessions                  # 查看所有标签的实时 hostname + 别名
-  jscmd sessions --refresh        # 强制重新检测所有标签 hostname
-  jscmd alias @current web        # 给活跃标签的 hostname 加别名
-  jscmd alias #2 db               # 给第 2 个标签的 hostname 加别名
-  jscmd alias --remove web        # 删除别名
   jscmd mode python               # 切换活跃标签到 Python REPL 模式
   jscmd mode shell                # 切换回 Shell 模式
   jscmd connect "web-01"          # 在 JumpServer 侧边栏搜索并打开服务器终端
@@ -49,7 +43,6 @@ except ImportError:
 
 DAEMON_SOCK = os.path.expanduser("~/.jscmd.sock")
 DAEMON_PID_FILE = os.path.expanduser("~/.jscmd.pid")
-ALIASES_FILE = os.path.expanduser("~/.jscmd_aliases.json")
 CONFIG_FILE = os.path.expanduser("~/.jscmd_config.json")
 
 LUNA_URL_KEYWORD = "/luna/"
@@ -80,7 +73,7 @@ DEFAULT_CONFIG = {
     "extra_confirm_patterns": [],
     "disable_safety": False,
     # daemon 服务化配置
-    "idle_timeout_seconds": 3600,    # 空闲自关超时（秒），0=禁用
+    "idle_timeout_seconds": 0,       # 空闲自关超时（秒），0=永久常驻（默认）
     "cdp_connect_retries": 3,        # Chrome WS 连接重试次数
     "cdp_connect_timeout": 20,       # 每次连接超时（秒）
     # JumpServer Luna 搜索 UI 选择器（可按实际页面覆盖）
@@ -101,19 +94,6 @@ def load_config() -> dict:
     merged.update(cfg)
     return merged
 
-
-def load_aliases() -> dict:
-    """加载 ~/.jscmd_aliases.json，返回 {hostname: [alias, ...]} 映射。"""
-    if not os.path.exists(ALIASES_FILE):
-        return {}
-    with open(ALIASES_FILE) as f:
-        return json.load(f)
-
-
-def save_aliases(aliases: dict):
-    """保存别名映射到文件。"""
-    with open(ALIASES_FILE, "w") as f:
-        json.dump(aliases, f, indent=2, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -581,7 +561,8 @@ class CDPDispatcher:
         output_buf = ""
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
-            if end_marker in output_buf:
+            # 主检测：\n 前导 + sentinel；容错：首帧无前导 \n 时直接以 sentinel 起始
+            if end_marker in output_buf or output_buf.lstrip().startswith(sentinel):
                 return output_buf, False
             remaining = deadline - asyncio.get_event_loop().time()
             if remaining <= 0:
@@ -670,8 +651,6 @@ class JscmdDaemon:
         self.luna_target_id = None
         self.iframe_contexts = []       # [(context_id, iframe_idx), ...]，按 DOM 顺序
         self._id_counter = 0
-        # 运行时 hostname 缓存（不持久化）: {iframe_idx: hostname}
-        self.hostname_cache: dict = {}
         self._loop = None
         # 保存连接参数供重连使用
         self._cdp_port = None
@@ -683,8 +662,12 @@ class JscmdDaemon:
         self._pending_sentinel_ctx_id: int = None
         # 空闲检测：记录最后一次请求时间（epoch 浮点）
         self._last_active: float = 0.0
+        # 空闲超时秒数（0=永久常驻），由 daemon start 启动时写入，优先于配置文件
+        self._idle_timeout_override: float = -1.0
         # 解释器模式（per-tab）：{tab_idx: "shell"/"python"/"node"/...}
         self._interpreter_mode: dict = {}
+        # 全局 exec 串行锁：防止并发 exec 竞争 _net_events 队列和全局输入焦点
+        self._exec_lock: asyncio.Lock = asyncio.Lock()
 
     def _nid(self) -> int:
         """生成递增消息 id。
@@ -721,8 +704,11 @@ class JscmdDaemon:
         """
         url = f"ws://127.0.0.1:{port}{ws_path}"
         print(f"[daemon] 连接 Chrome CDP: {url}", file=sys.stderr)
+        # ping_interval=None：禁用 websockets 自动 ping/pong——Chrome CDP 不回 pong，
+        # 否则 20s 后 websockets 会判断连接断开并关闭，导致反复重连/弹窗。
         self.browser_ws = await ws_connect(
             url, open_timeout=15,
+            ping_interval=None, ping_timeout=None,
         )
         self._cdp_port = port
         self._cdp_ws_path = ws_path
@@ -746,7 +732,6 @@ class JscmdDaemon:
         self.browser_ws = None
         self.session_id = None
         self.iframe_contexts = []
-        self.hostname_cache.clear()
 
         # 重新扫描所有 Chrome 实例
         ports = _find_active_ports()
@@ -934,21 +919,37 @@ class JscmdDaemon:
                             ctx.get("auxData", {}).get("frameId") != self.luna_target_id):
                         contexts_raw.append(ctx)
             self.iframe_contexts = await self._order_contexts(contexts_raw)
-            self.hostname_cache.clear()
             return
 
         # 使用 dispatcher 事件监听（CDPDispatcher 已启动时）
         ctx_queue: asyncio.Queue = asyncio.Queue()
         self._disp.add_event_handler("Runtime.executionContextCreated", ctx_queue)
-        try:
-            # disable 再 enable：强制 Chrome 重新推送所有 context 事件
-            disable_msg = self._msg("Runtime.disable", {})
-            await self._disp.request(disable_msg, timeout=3.0)
-            await asyncio.sleep(0.1)
-            enable_msg = self._msg("Runtime.enable", {})
-            await self._disp.request(enable_msg, timeout=5.0)
+        # 持有 _exec_lock 保护 Runtime.disable/enable 关键区段：
+        # Runtime.disable 会短暂中断 Network.webSocketFrameReceived 事件推送，
+        # 若与 exec_command 并发执行，正在等待哨兵的输出收集会丢帧导致超时。
+        # 等待无进行中的 exec 后再做 disable/enable，确保不打断输出收集。
+        async with self._exec_lock:
+            try:
+                # disable 再 enable：强制 Chrome 重新推送所有 context 事件
+                disable_msg = self._msg("Runtime.disable", {})
+                await self._disp.request(disable_msg, timeout=3.0)
+                # 立即恢复 Network 监听：Runtime.disable 会短暂中断 Network 事件，
+                # 在 Runtime.enable 之前补发可将盲区压缩到几毫秒。
+                try:
+                    net_restore = self._msg("Network.enable", {})
+                    await self._disp.request(net_restore, timeout=3.0)
+                except Exception:
+                    pass
+                await asyncio.sleep(0.1)
+                enable_msg = self._msg("Runtime.enable", {})
+                await self._disp.request(enable_msg, timeout=5.0)
+            except Exception:
+                self._disp.remove_event_handler("Runtime.executionContextCreated")
+                raise
 
-            # 收集事件（最多 4s，连续 1s 没有新事件就退出）
+        # 收集事件（最多 4s，连续 1s 没有新事件就退出）
+        # context 收集不需要持锁，不涉及 Network 事件流
+        try:
             contexts_raw = []
             deadline = asyncio.get_event_loop().time() + 4
             last_event_time = asyncio.get_event_loop().time()
@@ -968,7 +969,7 @@ class JscmdDaemon:
                     continue
         finally:
             self._disp.remove_event_handler("Runtime.executionContextCreated")
-            # 重新启用 Network.enable（disable 会影响网络监听）
+            # 再次确保 Network 监听已启用（防止异常路径遗漏）
             try:
                 net_msg = self._msg("Network.enable", {})
                 await self._disp.request(net_msg, timeout=3.0)
@@ -976,7 +977,6 @@ class JscmdDaemon:
                 pass
 
         self.iframe_contexts = await self._order_contexts(contexts_raw)
-        self.hostname_cache.clear()
 
     async def detect_active_tab(self) -> int:
         """检测当前活跃（可见）的 terminal 标签索引（0-based）。
@@ -1056,6 +1056,33 @@ class JscmdDaemon:
         if r.get("type") in ("string", "boolean", "number"):
             return r.get("value")
         return None
+
+    async def _switch_to_tab(self, tab_idx: int):
+        """在 Luna UI 中切换到第 tab_idx 个终端标签（0-based），使其成为可见 active 标签。
+
+        Input.insertText / Input.dispatchKeyEvent 只作用于当前可见的活跃元素；
+        对于隐藏的 iframe（非活跃 tab）发送输入会无效，因此执行前必须先切换 UI 标签。
+
+        DOM 结构：.tab-title span → li（点击 li 触发 Angular 切换）→ elements-content-tab。
+        必须点击 li 父元素而非 span，才能触发 Angular 的 click handler。
+
+        @param[in] tab_idx 0-based 标签索引
+        @return none
+        """
+        js = f"""
+(function() {{
+  var titles = Array.from(document.querySelectorAll('.tab-title'));
+  var t = titles[{tab_idx}];
+  if (!t) return 'not found: ' + titles.length + ' tabs';
+  // 必须点击 li 父元素，span 本身不绑定 Angular click handler
+  var li = t.parentElement;
+  li.click();
+  return 'ok:' + {tab_idx};
+}})()
+"""
+        await self._eval(js, 0, timeout=5.0)
+        # 等待 Angular 动画/渲染完成（active class 切换需要几帧）
+        await asyncio.sleep(0.3)
 
     async def _focus_xterm(self, ctx_id: int,
                             fire_and_forget: bool = False):
@@ -1167,7 +1194,8 @@ class JscmdDaemon:
         output_buf = ""
         deadline = asyncio.get_event_loop().time() + timeout
         while asyncio.get_event_loop().time() < deadline:
-            if end_marker in output_buf:
+            # 主检测：\n 前导 + sentinel；容错：首帧无前导 \n 时直接以 sentinel 起始
+            if end_marker in output_buf or output_buf.lstrip().startswith(sentinel):
                 return output_buf, False
             try:
                 raw = await asyncio.wait_for(
@@ -1189,45 +1217,6 @@ class JscmdDaemon:
             except asyncio.TimeoutError:
                 pass
         return output_buf, True
-
-    async def detect_hostname(self, tab_idx: int) -> str:
-        """在指定标签中静默检测 hostname。
-
-        @param[in] tab_idx 0-based 标签索引
-        @return hostname 字符串，检测失败返回空字符串
-        """
-        if tab_idx >= len(self.iframe_contexts):
-            return ""
-
-        ctx_id = self.iframe_contexts[tab_idx][0]
-        sentinel = f"__JSCMD_HN_{uuid.uuid4().hex[:8]}__"
-
-        await self._focus_xterm(ctx_id)
-
-        # 前导空格避免 bash history；用 printf 输出哨兵包裹 hostname，便于提取
-        # printf 格式保证实际换行，与 exec_command 的 sentinel 行为一致
-        await self._send_line(f" printf '\\n{sentinel}'$(hostname)'{sentinel}\\n'")
-
-        output_buf, _ = await self._collect_until_sentinel(sentinel, timeout=8.0)
-
-        clean = _strip_ansi(output_buf)
-        # 终端将 $(hostname) 展开后输出：SENTINEL<hostname>SENTINEL 在同一行
-        pattern = re.escape(sentinel) + r"([^\r\n]+?)" + re.escape(sentinel)
-        m = re.search(pattern, clean)
-        if m:
-            hn = m.group(1).strip()
-            if hn:
-                self.hostname_cache[tab_idx] = hn
-                return hn
-        # 退化匹配：找换行后的哨兵之前一行
-        lines = clean.replace("\r\n", "\n").replace("\r", "\n").split("\n")
-        for i, ln in enumerate(lines):
-            if sentinel in ln and i > 0:
-                candidate = lines[i - 1].strip()
-                if candidate:
-                    self.hostname_cache[tab_idx] = candidate
-                    return candidate
-        return ""
 
     async def get_tab_count(self) -> int:
         """获取当前 KoKo iframe 数量。
@@ -1252,87 +1241,101 @@ class JscmdDaemon:
             return (f"[ERROR] 标签 #{tab_idx + 1} 不存在"
                     f"（共 {len(self.iframe_contexts)} 个标签）")
 
-        ctx_id = self.iframe_contexts[tab_idx][0]
-        sentinel = f"__JSCMD_{uuid.uuid4().hex[:12]}__"
+        # 串行锁：防止并发 exec 竞争全局输入焦点和 _net_events 队列
+        async with self._exec_lock:
+            # 检查当前活跃标签，不一致时才切换，避免不必要的 UI 操作
+            active_idx = await self.detect_active_tab()
+            if active_idx != tab_idx:
+                print(f"[daemon] 当前活跃 #{active_idx + 1}，切换到 #{tab_idx + 1}", file=sys.stderr)
+                await self._switch_to_tab(tab_idx)
+                # 验证切换结果，最多重试一次
+                active_after = await self.detect_active_tab()
+                if active_after != tab_idx:
+                    print(f"[daemon] 警告：切换后活跃标签仍为 #{active_after + 1}，再等待 0.5s",
+                          file=sys.stderr)
+                    await asyncio.sleep(0.5)
 
-        # 读取当前标签的解释器模式
-        mode = self._interpreter_mode.get(tab_idx, "shell")
-        cfg = INTERPRETER_CONFIGS.get(mode, INTERPRETER_CONFIGS["shell"])
+            ctx_id = self.iframe_contexts[tab_idx][0]
+            sentinel = f"__JSCMD_{uuid.uuid4().hex[:12]}__"
 
-        # 清空残留事件（上一次 exec 或 Ctrl+C 后的尾部输出）
-        if self._disp:
-            await asyncio.sleep(0.15)
-            drained = 0
-            while not self._disp._net_events.empty():
-                try:
-                    self._disp._net_events.get_nowait()
-                    drained += 1
-                except asyncio.QueueEmpty:
-                    break
-            if drained:
-                print(f"[daemon] 清空 {drained} 个残留事件", file=sys.stderr)
+            # 读取当前标签的解释器模式
+            mode = self._interpreter_mode.get(tab_idx, "shell")
+            cfg = INTERPRETER_CONFIGS.get(mode, INTERPRETER_CONFIGS["shell"])
 
-        await self._focus_xterm(ctx_id)
+            # 清空残留事件（上一次 exec 或 Ctrl+C 后的尾部输出）
+            if self._disp:
+                await asyncio.sleep(0.3)
+                drained = 0
+                while not self._disp._net_events.empty():
+                    try:
+                        self._disp._net_events.get_nowait()
+                        drained += 1
+                    except asyncio.QueueEmpty:
+                        break
+                if drained:
+                    print(f"[daemon] 清空 {drained} 个残留事件", file=sys.stderr)
 
-        # 统一换行符，按行拆分
-        normalized = cmd.replace("\r\n", "\n").replace("\r", "\n")
-        lines = normalized.split("\n")
+            await self._focus_xterm(ctx_id)
 
-        # 根据解释器模式追加哨兵
-        sentinel_cmd = cfg["sentinel_cmd"].format(s=sentinel)
-        if cfg["append_mode"] == "suffix":
-            # Shell 模式：追加到最后一行末尾（; printf '\nSENTINEL\n'）
-            lines[-1] = lines[-1] + f"; {sentinel_cmd}"
-        else:
-            # 解释器模式：哨兵作为独立的新语句行
-            # 对 Python 多行代码块，先追加一个空行关闭 block，再追加哨兵
-            if len(lines) > 1 and mode == "python":
-                lines.append("")   # 空 Enter 关闭 for/if/def 块
-            lines.append(sentinel_cmd)
+            # 统一换行符，按行拆分
+            normalized = cmd.replace("\r\n", "\n").replace("\r", "\n")
+            lines = normalized.split("\n")
 
-        # 记录当前 pending sentinel，供并发 send-key ctrl-c 使用
-        self._pending_sentinel = sentinel
-        self._pending_sentinel_ctx_id = ctx_id
+            # 根据解释器模式追加哨兵
+            sentinel_cmd = cfg["sentinel_cmd"].format(s=sentinel)
+            if cfg["append_mode"] == "suffix":
+                # Shell 模式：追加到最后一行末尾（; printf '\nSENTINEL\n'）
+                lines[-1] = lines[-1] + f"; {sentinel_cmd}"
+            else:
+                # 解释器模式：哨兵作为独立的新语句行
+                # 对 Python 多行代码块，先追加一个空行关闭 block，再追加哨兵
+                if len(lines) > 1 and mode == "python":
+                    lines.append("")   # 空 Enter 关闭 for/if/def 块
+                lines.append(sentinel_cmd)
 
-        # 记录原始命令（用于事后检测解释器切换）
-        original_cmd = cmd.strip()
+            # 记录当前 pending sentinel，供并发 send-key ctrl-c 使用
+            self._pending_sentinel = sentinel
+            self._pending_sentinel_ctx_id = ctx_id
 
-        try:
-            # 逐行发送（支持多行构造如 for/if/while 的 > 提示符）
-            for line in lines:
-                await self._send_line(line)
-                # 多行脚本行间稍作等待，让 shell / 解释器显示提示符
-                if len(lines) > 1:
-                    await asyncio.sleep(0.12)
+            # 记录原始命令（用于事后检测解释器切换）
+            original_cmd = cmd.strip()
 
-            # 收集输出直到哨兵出现或超时
-            output_buf, timed_out = await self._collect_until_sentinel(
-                sentinel, timeout)
+            try:
+                # 逐行发送（支持多行构造如 for/if/while 的 > 提示符）
+                for line in lines:
+                    await self._send_line(line)
+                    # 多行脚本行间稍作等待，让 shell / 解释器显示提示符
+                    if len(lines) > 1:
+                        await asyncio.sleep(0.12)
 
-            # 超时时发送 Ctrl+C 中断阻塞命令，然后补发 sentinel 让收集可以结束
-            if timed_out:
-                await self._send_ctrl_c(ctx_id)
-                await asyncio.sleep(0.4)
-                await self._focus_xterm(ctx_id, fire_and_forget=True)
-                # 超时补发哨兵：根据模式选择命令
-                flush_cmd = sentinel_cmd if mode != "shell" else f"printf '\\n{sentinel}\\n'"
-                await self._send_line(flush_cmd)
-                extra_buf, _ = await self._collect_until_sentinel(sentinel, 5)
-                output_buf += extra_buf
-                partial = _extract_output(output_buf, sentinel, lines, mode)
-                header = (f"[TIMEOUT] 命令超时（{timeout:.0f}s），已发送 "
-                          f"Ctrl+C 中断\n部分输出:\n")
-                return header + partial if partial else header.rstrip()
-        finally:
-            self._pending_sentinel = None
-            self._pending_sentinel_ctx_id = None
+                # 收集输出直到哨兵出现或超时
+                output_buf, timed_out = await self._collect_until_sentinel(
+                    sentinel, timeout)
 
-        output = _extract_output(output_buf, sentinel, lines, mode)
+                # 超时时发送 Ctrl+C 中断阻塞命令，然后补发 sentinel 让收集可以结束
+                if timed_out:
+                    await self._send_ctrl_c(ctx_id)
+                    await asyncio.sleep(0.4)
+                    await self._focus_xterm(ctx_id, fire_and_forget=True)
+                    # 超时补发哨兵：根据模式选择命令
+                    flush_cmd = sentinel_cmd if mode != "shell" else f"printf '\\n{sentinel}\\n'"
+                    await self._send_line(flush_cmd)
+                    extra_buf, _ = await self._collect_until_sentinel(sentinel, 5)
+                    output_buf += extra_buf
+                    partial = _extract_output(output_buf, sentinel, lines, mode)
+                    header = (f"[TIMEOUT] 命令超时（{timeout:.0f}s），已发送 "
+                              f"Ctrl+C 中断\n部分输出:\n")
+                    return header + partial if partial else header.rstrip()
+            finally:
+                self._pending_sentinel = None
+                self._pending_sentinel_ctx_id = None
 
-        # 命令执行完毕后更新解释器模式（检测进入/退出子解释器）
-        self._update_interpreter_mode(tab_idx, original_cmd, output_buf)
+            output = _extract_output(output_buf, sentinel, lines, mode)
 
-        return output
+            # 命令执行完毕后更新解释器模式（检测进入/退出子解释器）
+            self._update_interpreter_mode(tab_idx, original_cmd, output_buf)
+
+            return output
 
     def _update_interpreter_mode(self, tab_idx: int,
                                    cmd: str, output_buf: str):
@@ -1404,6 +1407,8 @@ class JscmdDaemon:
         @param[in] server_name 要搜索的服务器名称
         @param[in] tab_wait    等待新标签出现的超时秒数（默认 8）
         @return {"ok": True, "tab": N, "hostname": "...", "url": "..."}
+        @note 新标签检测以 Luna DOM 中 KoKo iframe 数量为基线；不用 CDP 缓存长度，
+               避免关标签后缓存多于页面导致条件永不成立。
         """
         config = load_config()
         search_selector = (config.get("luna_search_selector") or
@@ -1460,7 +1465,6 @@ class JscmdDaemon:
             return {"ok": False, "error": error}
 
         # Step 2：轮询等待搜索结果出现（最多 5s）
-        iframe_count_before = len(self.iframe_contexts)
         matched_node_found = False
         deadline = asyncio.get_event_loop().time() + 5.0
         while asyncio.get_event_loop().time() < deadline:
@@ -1521,6 +1525,13 @@ class JscmdDaemon:
         clicked_name = click_result.get("text", server_name)
         print(f"[daemon] 已双击节点: {clicked_name}", file=sys.stderr)
 
+        # Step 3b：用 Luna 页面上真实 KoKo iframe 数量作基线（与 Step 4 同一数据源）。
+        # 若仅用 len(self.iframe_contexts)，在关标签后未 refresh 时 CDP 列表可能多于 DOM，
+        # 导致「DOM 已从 4 增到 5」仍满足不了 len(dom)>len(cdp) 而一直超时（与 shell 初始化无关）。
+        iframe_count_before = await self.get_tab_count()
+        print(f"[daemon] 连接前 Luna 页 KoKo iframe 数(基线)={iframe_count_before}",
+              file=sys.stderr)
+
         # Step 4：等待新 KoKo iframe 出现（轮询 iframe list，最多 tab_wait 秒）
         deadline2 = asyncio.get_event_loop().time() + tab_wait
         new_iframe_url = None
@@ -1580,17 +1591,9 @@ class JscmdDaemon:
                 if new_tab_idx is None:
                     new_tab_idx = len(self.iframe_contexts) - 1
 
-        # Step 6：获取新标签的 hostname
-        await asyncio.sleep(1.5)  # 等待 xterm 渲染和 shell 提示符
-        try:
-            hostname = await self.detect_hostname(new_tab_idx)
-        except (IndexError, Exception):
-            hostname = "(检测中)"
-
         return {
             "ok": True,
             "tab": new_tab_idx + 1,
-            "hostname": hostname,
             "url": new_iframe_url,
             "clicked_node": clicked_name,
         }
@@ -1598,19 +1601,14 @@ class JscmdDaemon:
     async def list_tabs(self) -> list:
         """列出所有终端标签的状态信息。
 
-        @return [{idx, hostname, aliases, active}, ...] 列表
+        @return [{idx, active}, ...] 列表
         """
-        aliases = load_aliases()
         active_idx = await self.detect_active_tab()
         result = []
         for i, (ctx_id, src) in enumerate(self.iframe_contexts):
-            hn = self.hostname_cache.get(i, "")
-            alias_list = aliases.get(hn, []) if hn else []
             result.append({
                 "idx": i + 1,
                 "context_id": ctx_id,
-                "hostname": hn or "(未检测)",
-                "aliases": alias_list,
                 "active": (i == active_idx),
             })
         return result
@@ -1629,13 +1627,6 @@ class JscmdDaemon:
         if cmd == "list":
             tabs = await self.list_tabs()
             return {"ok": True, "tabs": tabs}
-
-        if cmd == "get_hostname":
-            tab_idx = req.get("tab")  # 0-based，None=活跃标签
-            if tab_idx is None:
-                tab_idx = await self.detect_active_tab()
-            hn = await self.detect_hostname(tab_idx)
-            return {"ok": True, "hostname": hn, "tab": tab_idx + 1}
 
         if cmd == "refresh":
             await self.refresh_contexts()
@@ -1695,22 +1686,61 @@ class JscmdDaemon:
                         "error": f"标签 #{tab_idx + 1} 不存在"}
 
             ctx_id = self.iframe_contexts[tab_idx][0]
+            await self._switch_to_tab(tab_idx)
             await self._send_special_key(ctx_id, key_name)
             return {"ok": True, "key": key_name, "tab": tab_idx + 1}
 
         return {"ok": False, "error": f"未知命令: {cmd}"}
 
-    async def _idle_checker(self):
-        """后台空闲检测任务：每 5 分钟检查一次，超过配置阈值则自动退出。
+    async def _heartbeat(self):
+        """后台心跳任务：每 25s 发一次 Browser.getVersion 维持 Chrome WS 连接。
 
-        阈值由 ~/.jscmd_config.json 的 idle_timeout_seconds 控制，0=禁用。
+        不依赖 websockets 的 ping/pong（Chrome CDP 不回 pong），
+        改用 CDP 协议层的消息来防止连接被中间件或 Chrome 超时关闭。
+        若连续 2 次心跳均失败，主动触发重连，避免下次请求时才发现断线。
 
         @return none
         """
-        config = load_config()
-        idle_timeout = float(config.get("idle_timeout_seconds", 3600))
+        fail_count = 0
+        while True:
+            await asyncio.sleep(25)
+            if self.browser_ws is None:
+                continue
+            try:
+                mid = self._nid()
+                await asyncio.wait_for(
+                    self.browser_ws.send(json.dumps(
+                        {"id": mid, "method": "Browser.getVersion", "params": {}}
+                    )), timeout=5)
+                fail_count = 0
+            except Exception as e:
+                fail_count += 1
+                print(f"[daemon] 心跳失败({fail_count}/2): {e}", file=sys.stderr)
+                if fail_count >= 2:
+                    print("[daemon] 连续心跳失败，主动重连...", file=sys.stderr)
+                    await self.reconnect()
+                    fail_count = 0
+
+    async def _idle_checker(self):
+        """后台空闲检测任务：每 5 分钟检查一次，超过阈值则自动退出。
+
+        优先级：命令行 --idle-timeout > ~/.jscmd_config.json idle_timeout_seconds > 默认值 0。
+        0 = 永久常驻（默认），不自动退出。
+
+        @return none
+        """
+        # 优先使用启动时通过 --idle-timeout 传入的值，否则读配置文件
+        if self._idle_timeout_override >= 0:
+            idle_timeout = self._idle_timeout_override
+        else:
+            config = load_config()
+            idle_timeout = float(config.get("idle_timeout_seconds", 0))
+
         if idle_timeout <= 0:
-            return  # 禁用
+            return  # 0 = 永久常驻，不启动检测
+
+        print(f"[daemon] 空闲超时已设置：{idle_timeout:.0f}s 无请求后自动退出",
+              file=sys.stderr)
 
         while True:
             await asyncio.sleep(300)  # 每 5 分钟检查一次
@@ -1720,9 +1750,8 @@ class JscmdDaemon:
             if idle >= idle_timeout:
                 print(
                     f"[daemon] 已空闲 {idle:.0f}s（超过 {idle_timeout:.0f}s），"
-                    "自动退出以释放 Chrome 连接。",
+                    "自动退出。",
                     file=sys.stderr)
-                # 清理文件后退出
                 for path in (DAEMON_PID_FILE, DAEMON_SOCK):
                     try:
                         os.unlink(path)
@@ -1742,8 +1771,9 @@ class JscmdDaemon:
         server = await asyncio.start_unix_server(
             self._handle_client, path=DAEMON_SOCK)
 
-        # 启动空闲检测后台任务
+        # 启动后台任务：空闲检测 + CDP 心跳
         asyncio.create_task(self._idle_checker())
+        asyncio.create_task(self._heartbeat())
 
         print(f"[daemon] 监听 Unix socket: {DAEMON_SOCK}", file=sys.stderr)
         async with server:
@@ -1789,12 +1819,13 @@ class JscmdDaemon:
 # 守护进程启动/停止
 # ---------------------------------------------------------------------------
 
-async def _daemon_main():
+async def _daemon_main(idle_timeout: float = -1.0):
     """daemon 异步入口：扫描 Chrome、连接（支持重试）、启动服务。
 
     Chrome 首次连接会弹出安全授权弹窗，弹窗后会提示用户在 Chrome 中点击「允许」。
     最多重试 cdp_connect_retries 次，每次等待 cdp_connect_timeout 秒。
 
+    @param[in] idle_timeout 空闲超时秒数（0=永久常驻，-1=使用配置文件值）
     @return none
     """
     config = load_config()
@@ -1809,6 +1840,7 @@ async def _daemon_main():
         sys.exit(1)
 
     daemon = JscmdDaemon()
+    daemon._idle_timeout_override = idle_timeout  # -1=使用配置文件，>=0=命令行覆盖
 
     # 扫描找包含 JumpServer Luna 的 Chrome 实例（支持弹窗重试）
     connected = False
@@ -1818,7 +1850,8 @@ async def _daemon_main():
         for attempt in range(max_retries):
             try:
                 daemon.browser_ws = await asyncio.wait_for(
-                    ws_connect(_url), timeout=connect_timeout)
+                    ws_connect(_url, ping_interval=None, ping_timeout=None),
+                    timeout=connect_timeout)
                 daemon._cdp_port = port
                 daemon._cdp_ws_path = ws_path
                 print("[daemon] Chrome 连接成功"
@@ -1911,9 +1944,9 @@ def cmd_daemon_start(args):
             file=sys.stderr)
         return
 
-    # 子进程：运行 daemon
+    # 子进程：运行 daemon（传入命令行指定的空闲超时，-1 表示未指定则读配置文件）
     os.setsid()
-    asyncio.run(_daemon_main())
+    asyncio.run(_daemon_main(idle_timeout=float(getattr(args, "idle_timeout", -1.0))))
 
 
 def cmd_daemon_stop(args):
@@ -2043,12 +2076,12 @@ def _send_to_daemon(req: dict, timeout: float = 35.0,
 # ---------------------------------------------------------------------------
 
 def _parse_tab_and_cmd(raw_cmd: str, tab_arg) -> tuple:
-    """解析命令字符串中的 #N / N# / @name 前缀，返回 (tab_spec, clean_cmd)。
+    """解析命令字符串中的 #N / N# 前缀，返回 (tab_spec, clean_cmd)。
 
     @param[in] raw_cmd  原始命令字符串（可能含前缀）
     @param[in] tab_arg  --tab 参数（优先级最高），None 表示未指定
     @return (tab_spec, clean_cmd)
-             tab_spec: None=活跃标签, int=1-based 位置, str=@name
+             tab_spec: None=活跃标签, int=1-based 位置
     """
     if tab_arg is not None:
         return int(tab_arg), raw_cmd
@@ -2061,68 +2094,7 @@ def _parse_tab_and_cmd(raw_cmd: str, tab_arg) -> tuple:
     if m:
         return int(m.group(1)), m.group(2).strip()
 
-    # @name 前缀
-    m = re.match(r"^@(\S+)\s+(.*)", raw_cmd, re.DOTALL)
-    if m:
-        return m.group(1), m.group(2).strip()
-
     return None, raw_cmd
-
-
-def _resolve_name_to_tab(name: str) -> int:
-    """将 @name 解析为实际 tab 索引（0-based），通过实时 hostname 检测。
-
-    @param[in] name 别名或 hostname 字符串
-    @return 0-based tab 索引，-1 表示未找到
-    """
-    aliases = load_aliases()
-
-    # 先找 expected hostname
-    expected_hostname = None
-    # 精确 hostname 匹配
-    if name in aliases:
-        expected_hostname = name
-    else:
-        # 别名匹配
-        for hn, alias_list in aliases.items():
-            if name in alias_list:
-                expected_hostname = hn
-                break
-        # 子串匹配（hostname 包含 name）
-        if not expected_hostname:
-            candidates = [hn for hn in aliases if name in hn]
-            if len(candidates) == 1:
-                expected_hostname = candidates[0]
-            elif len(candidates) > 1:
-                print(f"[jscmd] @{name} 匹配到多个 hostname: {candidates}", file=sys.stderr)
-                return -1
-
-    if not expected_hostname:
-        # 如果没有记录，直接用 name 作为 hostname 尝试匹配
-        expected_hostname = name
-
-    # 向 daemon 询问 tab 数量
-    ping = _send_to_daemon({"cmd": "ping"})
-    if not ping.get("ok"):
-        print(f"[jscmd] {ping.get('error')}", file=sys.stderr)
-        return -1
-
-    tab_count = ping.get("tabs", 0)
-
-    # 对每个 tab 执行 hostname 检测
-    for tab_0based in range(tab_count):
-        resp = _send_to_daemon({"cmd": "get_hostname", "tab": tab_0based}, timeout=15)
-        if resp.get("ok"):
-            hn = resp.get("hostname", "")
-            if hn == expected_hostname:
-                return tab_0based
-            # 子串模糊匹配（name 是 hostname 的一部分）
-            if name in hn:
-                return tab_0based
-
-    print(f"[jscmd] 未找到 hostname 为 '{expected_hostname}' 的标签。", file=sys.stderr)
-    print("  使用 'jscmd sessions' 查看当前标签状态。", file=sys.stderr)
-    return -1
 
 
 # ---------------------------------------------------------------------------
@@ -2154,11 +2126,6 @@ def cmd_exec(args):
         tab_0based = None  # daemon 自动检测活跃标签
     elif isinstance(tab_spec, int):
         tab_0based = tab_spec - 1
-    elif isinstance(tab_spec, str):
-        # @name 解析
-        tab_0based = _resolve_name_to_tab(tab_spec)
-        if tab_0based < 0:
-            sys.exit(1)
 
     req = {
         "cmd": "exec",
@@ -2177,8 +2144,6 @@ def cmd_exec(args):
 def cmd_connect(args):
     """在 JumpServer 侧边栏搜索服务器名称并自动打开终端标签。
 
-    搜索结果按第一个匹配项打开；打开后自动检测 hostname 并输出新标签编号。
-
     @param[in] args argparse 参数（server_name, --tab-wait）
     @return none
     """
@@ -2195,7 +2160,6 @@ def cmd_connect(args):
     if resp.get("ok"):
         print(f"[jscmd] 已打开终端标签 #{resp['tab']}")
         print(f"  服务器: {resp.get('clicked_node', server_name)}")
-        print(f"  hostname: {resp.get('hostname', '(检测中)')}")
         if resp.get("url"):
             print(f"  URL: {resp['url'][:60]}...")
     else:
@@ -2286,114 +2250,7 @@ def cmd_list(args):
         return
     for t in tabs:
         active_mark = " ← 活跃" if t["active"] else ""
-        alias_str = f"  aliases={t['aliases']}" if t["aliases"] else ""
-        print(f"  #{t['idx']}  host={t['hostname']}{alias_str}{active_mark}")
-
-
-def cmd_sessions(args):
-    """查看所有标签的实时 hostname + 别名状态。
-
-    @param[in] args argparse 参数（含 refresh 标志）
-    @return none
-    """
-    if getattr(args, "refresh", False):
-        resp = _send_to_daemon({"cmd": "refresh"})
-        if resp.get("ok"):
-            print(f"[jscmd] 已刷新，共 {resp['tabs']} 个标签。")
-        else:
-            print(f"[jscmd] 刷新失败: {resp.get('error')}", file=sys.stderr)
-            return
-
-    aliases = load_aliases()
-
-    # 逐个检测 hostname（实时）
-    ping = _send_to_daemon({"cmd": "ping"})
-    if not ping.get("ok"):
-        print(f"[jscmd] {ping.get('error')}", file=sys.stderr)
-        sys.exit(1)
-
-    tab_count = ping.get("tabs", 0)
-    if tab_count == 0:
-        print("[jscmd] 当前没有打开的 JumpServer 终端标签。")
-        return
-
-    print(f"[jscmd] 正在检测 {tab_count} 个标签的 hostname...")
-
-    # 获取完整 list（含活跃标记）
-    resp = _send_to_daemon({"cmd": "list"}, timeout=60)
-    tabs_info = {t["idx"]: t for t in resp.get("tabs", [])}
-
-    for i in range(1, tab_count + 1):
-        hn_resp = _send_to_daemon({"cmd": "get_hostname", "tab": i - 1}, timeout=15)
-        hn = hn_resp.get("hostname", "(检测失败)") if hn_resp.get("ok") else "(检测失败)"
-        alias_list = aliases.get(hn, [])
-        active_mark = " ← 活跃" if tabs_info.get(i, {}).get("active") else ""
-        alias_str = f"  aliases={alias_list}" if alias_list else "  (无别名)"
-        print(f"  #{i}  host={hn}{alias_str}{active_mark}")
-
-
-def cmd_alias(args):
-    """管理 hostname 别名。
-
-    @param[in] args argparse 参数
-    @return none
-    """
-    aliases = load_aliases()
-
-    if getattr(args, "remove", None):
-        # 删除别名
-        target = args.remove
-        removed = False
-        for hn, alias_list in aliases.items():
-            if target in alias_list:
-                alias_list.remove(target)
-                removed = True
-                print(f"[jscmd] 已从 {hn} 移除别名 '{target}'")
-        if not removed:
-            print(f"[jscmd] 未找到别名 '{target}'。", file=sys.stderr)
-            return
-        save_aliases(aliases)
-        return
-
-    # 添加别名：jscmd alias <target> <name>
-    target = args.target   # @current / #N / hostname
-    new_alias = args.name
-
-    # 解析 target 获取 hostname
-    hostname = None
-    if target == "@current" or target == "current":
-        # 检测活跃标签的 hostname
-        resp = _send_to_daemon({"cmd": "get_hostname", "tab": None}, timeout=15)
-        # tab=None 时 daemon 自动用活跃标签，此处需特殊处理
-        # 先获取活跃标签索引
-        list_resp = _send_to_daemon({"cmd": "list"}, timeout=30)
-        active_tabs = [t for t in list_resp.get("tabs", []) if t["active"]]
-        if active_tabs:
-            tab_0based = active_tabs[0]["idx"] - 1
-            hn_resp = _send_to_daemon({"cmd": "get_hostname", "tab": tab_0based}, timeout=15)
-            hostname = hn_resp.get("hostname") if hn_resp.get("ok") else None
-    elif target.startswith("#") or re.match(r"^\d+$", target):
-        # #N 或数字
-        n = int(target.lstrip("#")) - 1
-        hn_resp = _send_to_daemon({"cmd": "get_hostname", "tab": n}, timeout=15)
-        hostname = hn_resp.get("hostname") if hn_resp.get("ok") else None
-    else:
-        # 直接视为 hostname
-        hostname = target
-
-    if not hostname or hostname == "(未检测)":
-        print("[jscmd] 无法获取目标标签的 hostname，请先执行 'jscmd sessions' 检测。",
-              file=sys.stderr)
-        return
-
-    if hostname not in aliases:
-        aliases[hostname] = []
-    if new_alias not in aliases[hostname]:
-        aliases[hostname].append(new_alias)
-        save_aliases(aliases)
-        print(f"[jscmd] 已添加: {hostname} → 别名 '{new_alias}'")
-    else:
-        print(f"[jscmd] 别名 '{new_alias}' 已存在于 {hostname}。")
+        print(f"  #{t['idx']}{active_mark}")
 
 
 # ---------------------------------------------------------------------------
@@ -2414,13 +2271,20 @@ def build_parser() -> argparse.ArgumentParser:
     # daemon
     p_daemon = sub.add_parser("daemon", help="管理后台 daemon")
     daemon_sub = p_daemon.add_subparsers(dest="daemon_action", required=True)
-    daemon_sub.add_parser("start", help="启动 daemon")
+    p_daemon_start = daemon_sub.add_parser("start", help="启动 daemon")
+    p_daemon_start.add_argument(
+        "--idle-timeout", dest="idle_timeout", type=float, default=-1.0,
+        metavar="SECONDS",
+        help="空闲自动退出时间（秒）。0=永久常驻（默认）；"
+             "正数=空闲超过该秒数后自动退出。"
+             "优先于 ~/.jscmd_config.json 的 idle_timeout_seconds。"
+             "示例: --idle-timeout 3600 表示 1 小时无请求后自动退出。")
     daemon_sub.add_parser("stop", help="停止 daemon")
     daemon_sub.add_parser("status", help="查看 daemon 状态")
 
     # exec
     p_exec = sub.add_parser("exec", help="执行命令")
-    p_exec.add_argument("command", help="命令字符串（支持 #N / N# / @name 前缀）")
+    p_exec.add_argument("command", help="命令字符串（支持 #N / N# 前缀指定标签）")
     p_exec.add_argument("--tab", "-t", type=int, default=None,
                         help="指定 1-based 标签编号（优先级最高）")
     p_exec.add_argument("--timeout", type=float, default=30,
@@ -2428,18 +2292,6 @@ def build_parser() -> argparse.ArgumentParser:
 
     # list
     sub.add_parser("list", help="列出所有终端标签")
-
-    # sessions
-    p_sess = sub.add_parser("sessions", help="查看标签 hostname/别名状态")
-    p_sess.add_argument("--refresh", action="store_true",
-                        help="强制重新检测所有标签 hostname")
-
-    # alias
-    p_alias = sub.add_parser("alias", help="管理 hostname 别名")
-    p_alias.add_argument("target", nargs="?",
-                         help="目标：@current / #N / hostname")
-    p_alias.add_argument("name", nargs="?", help="要添加的别名")
-    p_alias.add_argument("--remove", metavar="ALIAS", help="删除指定别名")
 
     # connect
     p_connect = sub.add_parser(
@@ -2519,12 +2371,6 @@ def main():
 
     elif args.subcommand == "list":
         cmd_list(args)
-
-    elif args.subcommand == "sessions":
-        cmd_sessions(args)
-
-    elif args.subcommand == "alias":
-        cmd_alias(args)
 
     elif args.subcommand == "mode":
         cmd_mode(args)
