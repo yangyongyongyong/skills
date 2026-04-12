@@ -692,6 +692,8 @@ class JscmdDaemon:
         self._exec_lock: asyncio.Lock = asyncio.Lock()
         # refresh 串行锁：防止 _watch_new_tabs 和 exec 同时触发 refresh_contexts 互相干扰
         self._refresh_lock: asyncio.Lock = asyncio.Lock()
+        # refresh 进行中标志：_watch_new_tabs 在此期间忽略 context 事件，避免循环触发
+        self._refreshing: bool = False
 
     def _nid(self) -> int:
         """生成递增消息 id。
@@ -973,6 +975,20 @@ class JscmdDaemon:
 
     async def _do_refresh_contexts(self):
         """refresh_contexts 的实际实现，由 _refresh_lock 保护。
+
+        设置 _refreshing 标志防止 _watch_new_tabs 在此期间
+        因 Runtime.disable/enable 产生的 context 事件而循环触发 refresh。
+
+        @return none
+        """
+        self._refreshing = True
+        try:
+            await self.__refresh_impl()
+        finally:
+            self._refreshing = False
+
+    async def __refresh_impl(self):
+        """refresh 的核心逻辑，被 _do_refresh_contexts 包装。
 
         @return none
         """
@@ -1919,17 +1935,20 @@ class JscmdDaemon:
                         if self._disp is None or not self._disp._running:
                             break
                         continue
+                    # refresh 进行中产生的 context 事件全部忽略，避免循环触发
+                    if self._refreshing or _pending_refresh:
+                        continue
                     ctx = msg.get("params", {}).get("context", {})
-                    # 只关注无名（非 Luna 主框架）的 context
                     if (ctx.get("name", "") == "" and
                             ctx.get("auxData", {}).get("frameId") != self.luna_target_id):
                         ctx_id = ctx.get("id")
-                        existing_ids = {c.get("id") for c in self.iframe_contexts}
-                        if ctx_id not in existing_ids and not _pending_refresh:
+                        existing_ids = {c[0] for c in self.iframe_contexts}
+                        if ctx_id not in existing_ids:
                             _pending_refresh = True
-                            # 短暂等待同批事件收齐，然后全量刷新
                             await asyncio.sleep(1.0)
                             _pending_refresh = False
+                            if self._refreshing:
+                                continue
                             prev_count = len(self.iframe_contexts)
                             await self.refresh_contexts()
                             if len(self.iframe_contexts) != prev_count:
