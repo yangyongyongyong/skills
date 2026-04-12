@@ -790,13 +790,21 @@ class JscmdDaemon:
     async def find_luna_page(self) -> bool:
         """在已连接的 Chrome 中找到 JumpServer Luna 页面并附加 CDP session。
 
+        dispatcher 运行时通过 dispatcher 发送请求，避免与 _recv_loop 竞争 recv()。
+
         @return True 找到并附加成功
         """
-        i = self._nid()
-        await self.browser_ws.send(json.dumps(
-            {"id": i, "method": "Target.getTargets", "params": {}}))
-        msg = await self._recv_until(i)
-        targets = msg.get("result", {}).get("targetInfos", [])
+        use_disp = self._disp is not None and self._disp._running
+
+        # ---- 1. Target.getTargets ----
+        get_msg = {"id": self._nid(), "method": "Target.getTargets", "params": {}}
+        if use_disp:
+            resp = await self._disp.request(get_msg, timeout=10.0)
+        else:
+            await self.browser_ws.send(json.dumps(get_msg))
+            resp = await self._recv_until(get_msg["id"])
+
+        targets = resp.get("result", {}).get("targetInfos", [])
         luna_pages = [t for t in targets
                       if t.get("type") == "page" and LUNA_URL_KEYWORD in t.get("url", "")]
 
@@ -805,28 +813,45 @@ class JscmdDaemon:
                   file=sys.stderr)
             return False
 
-        # 选可见的（visibilityState=visible），优先；否则取第一个
         target = luna_pages[0]
         self.luna_target_id = target["targetId"]
         print(f"[daemon] 找到 Luna 页面: {target['url'][:80]}", file=sys.stderr)
 
-        # 附加 session
-        i = self._nid()
-        await self.browser_ws.send(json.dumps({
-            "id": i, "method": "Target.attachToTarget",
-            "params": {"targetId": self.luna_target_id, "flatten": True}
-        }))
-        # attachToTarget 先发 attachedToTarget 事件，再发 id 响应
-        deadline = asyncio.get_event_loop().time() + 10
-        while asyncio.get_event_loop().time() < deadline:
+        # ---- 2. Target.attachToTarget ----
+        # attachToTarget 先推送 Target.attachedToTarget 事件，再发 id 响应。
+        # 通过 dispatcher 时，用事件 queue 捕获 attachedToTarget。
+        attach_msg = {"id": self._nid(), "method": "Target.attachToTarget",
+                      "params": {"targetId": self.luna_target_id, "flatten": True}}
+        if use_disp:
+            evt_q: asyncio.Queue = asyncio.Queue()
+            self._disp.add_event_handler("Target.attachedToTarget", evt_q)
             try:
-                raw = await asyncio.wait_for(self.browser_ws.recv(), timeout=3)
-            except asyncio.TimeoutError:
-                break
-            msg = json.loads(raw)
-            if msg.get("method") == "Target.attachedToTarget":
-                self.session_id = msg["params"]["sessionId"]
-                break
+                await self._disp.send_only(attach_msg)
+                deadline = asyncio.get_event_loop().time() + 10
+                while asyncio.get_event_loop().time() < deadline:
+                    try:
+                        evt = await asyncio.wait_for(evt_q.get(), timeout=2.0)
+                        params = evt.get("params", {})
+                        if params.get("targetInfo", {}).get("targetId") == self.luna_target_id:
+                            self.session_id = params["sessionId"]
+                            break
+                    except asyncio.TimeoutError:
+                        break
+            finally:
+                self._disp.remove_event_handler("Target.attachedToTarget", evt_q)
+        else:
+            await self.browser_ws.send(json.dumps(attach_msg))
+            deadline = asyncio.get_event_loop().time() + 10
+            while asyncio.get_event_loop().time() < deadline:
+                try:
+                    raw = await asyncio.wait_for(self.browser_ws.recv(), timeout=3)
+                except asyncio.TimeoutError:
+                    break
+                msg = json.loads(raw)
+                if msg.get("method") == "Target.attachedToTarget":
+                    self.session_id = msg["params"]["sessionId"]
+                    break
+
         if not self.session_id:
             print("[daemon] 附加 Luna session 失败。", file=sys.stderr)
             return False
