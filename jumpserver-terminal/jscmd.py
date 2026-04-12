@@ -457,8 +457,9 @@ class CDPDispatcher:
         self._ws = ws
         self._pending: dict = {}            # msg_id → asyncio.Future
         self._net_events: asyncio.Queue = asyncio.Queue()  # 终端 WS 帧事件
-        self._event_handlers: dict = {}    # method_name → asyncio.Queue
+        self._event_handlers: dict = {}    # method_name → List[asyncio.Queue]
         self._task = None
+        self._running: bool = False
 
     async def start(self):
         """启动后台接收循环。
@@ -482,25 +483,41 @@ class CDPDispatcher:
     def add_event_handler(self, method: str, queue: asyncio.Queue):
         """注册额外的事件监听队列，将匹配 method 的消息投入 queue。
 
+        同一 method 可注册多个 queue，互不干扰。
+
         @param[in] method CDP 事件方法名（如 Runtime.executionContextCreated）
         @param[in] queue  接收事件的 asyncio.Queue
         @return none
         """
-        self._event_handlers[method] = queue
+        if method not in self._event_handlers:
+            self._event_handlers[method] = []
+        if queue not in self._event_handlers[method]:
+            self._event_handlers[method].append(queue)
 
-    def remove_event_handler(self, method: str):
+    def remove_event_handler(self, method: str, queue: asyncio.Queue = None):
         """取消注册指定方法的事件监听。
 
+        若传入 queue，只移除该 queue；否则移除该 method 的所有 queue。
+
         @param[in] method CDP 事件方法名
+        @param[in] queue  要移除的具体 queue（可选）
         @return none
         """
-        self._event_handlers.pop(method, None)
+        if queue is None:
+            self._event_handlers.pop(method, None)
+        else:
+            queues = self._event_handlers.get(method, [])
+            if queue in queues:
+                queues.remove(queue)
+            if not queues:
+                self._event_handlers.pop(method, None)
 
     async def _recv_loop(self):
         """后台 WS 接收循环，将消息路由到对应 Future 或事件队列。
 
         @return none
         """
+        self._running = True
         try:
             async for raw in self._ws:
                 msg = json.loads(raw)
@@ -511,15 +528,18 @@ class CDPDispatcher:
                         fut.set_result(msg)
                 elif msg.get("method") == "Network.webSocketFrameReceived":
                     await self._net_events.put(msg)
-                # 将其他事件投给已注册的监听队列
+                # 广播给该 method 的所有注册 queue
                 method = msg.get("method")
                 if method and method in self._event_handlers:
-                    await self._event_handlers[method].put(msg)
+                    for q in list(self._event_handlers[method]):
+                        await q.put(msg)
         except Exception as e:
             # 连接断开时通知所有等待者
             for fut in list(self._pending.values()):
                 if not fut.done():
                     fut.set_exception(e)
+        finally:
+            self._running = False
 
     async def request(self, msg: dict, timeout: float = 10.0) -> dict:
         """发送 CDP 消息并等待对应 id 的响应。
@@ -948,7 +968,7 @@ class JscmdDaemon:
                 enable_msg = self._msg("Runtime.enable", {})
                 await self._disp.request(enable_msg, timeout=5.0)
             except Exception:
-                self._disp.remove_event_handler("Runtime.executionContextCreated")
+                self._disp.remove_event_handler("Runtime.executionContextCreated", ctx_queue)
                 raise
 
         # 收集事件（最多 4s，连续 1s 没有新事件就退出）
@@ -972,7 +992,7 @@ class JscmdDaemon:
                 except asyncio.TimeoutError:
                     continue
         finally:
-            self._disp.remove_event_handler("Runtime.executionContextCreated")
+            self._disp.remove_event_handler("Runtime.executionContextCreated", ctx_queue)
             # 再次确保 Network 监听已启用（防止异常路径遗漏）
             try:
                 net_msg = self._msg("Network.enable", {})
@@ -1823,13 +1843,16 @@ class JscmdDaemon:
 
         用户在 JumpServer 侧边栏打开新终端时，Luna 页面会动态插入新 iframe，
         Chrome 会发出新的 executionContextCreated 事件。
-        本任务捕获这些事件并把新 context 追加到 iframe_contexts 列表，
-        无需重启 daemon 或手动刷新。
+        本任务捕获后触发 refresh_contexts 全量刷新，无需重启 daemon 或手动刷新。
+
+        注意：dispatcher 支持多 queue 广播，此处注册不会影响 refresh_contexts 的监听。
 
         @return none
         """
+        _pending_refresh = False  # 防抖标志，短时间内多个事件只触发一次 refresh
+
         while True:
-            if self._disp is None:
+            if self._disp is None or not self._disp._running:
                 await asyncio.sleep(1)
                 continue
 
@@ -1840,29 +1863,28 @@ class JscmdDaemon:
                     try:
                         msg = await asyncio.wait_for(q.get(), timeout=5.0)
                     except asyncio.TimeoutError:
-                        # 检查 dispatcher 是否仍在运行
                         if self._disp is None or not self._disp._running:
                             break
                         continue
                     ctx = msg.get("params", {}).get("context", {})
-                    # 只关注无名（iframe内容）、非 Luna 主页面的 context
+                    # 只关注无名（非 Luna 主框架）的 context
                     if (ctx.get("name", "") == "" and
                             ctx.get("auxData", {}).get("frameId") != self.luna_target_id):
                         ctx_id = ctx.get("id")
                         existing_ids = {c.get("id") for c in self.iframe_contexts}
-                        if ctx_id not in existing_ids:
-                            # 延迟一小会儿等 iframe src 写入 DOM
-                            await asyncio.sleep(0.3)
-                            # 重新用 _order_contexts 确认是 KoKo frame 并排序
-                            candidates = self.iframe_contexts + [ctx]
-                            ordered = await self._order_contexts(candidates)
-                            if len(ordered) > len(self.iframe_contexts):
-                                self.iframe_contexts = ordered
-                                print(f"[daemon] 检测到新标签，当前共 "
+                        if ctx_id not in existing_ids and not _pending_refresh:
+                            _pending_refresh = True
+                            # 短暂等待同批事件收齐，然后全量刷新
+                            await asyncio.sleep(1.0)
+                            _pending_refresh = False
+                            prev_count = len(self.iframe_contexts)
+                            await self.refresh_contexts()
+                            if len(self.iframe_contexts) != prev_count:
+                                print(f"[daemon] 标签数变化: {prev_count} → "
                                       f"{len(self.iframe_contexts)} 个 KoKo 终端标签",
                                       file=sys.stderr)
             finally:
-                self._disp.remove_event_handler("Runtime.executionContextCreated")
+                self._disp.remove_event_handler("Runtime.executionContextCreated", q)
             await asyncio.sleep(1)
 
     async def _idle_checker(self):
