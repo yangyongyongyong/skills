@@ -690,6 +690,8 @@ class JscmdDaemon:
         self._interpreter_mode: dict = {}
         # 全局 exec 串行锁：防止并发 exec 竞争 _net_events 队列和全局输入焦点
         self._exec_lock: asyncio.Lock = asyncio.Lock()
+        # refresh 串行锁：防止 _watch_new_tabs 和 exec 同时触发 refresh_contexts 互相干扰
+        self._refresh_lock: asyncio.Lock = asyncio.Lock()
 
     def _nid(self) -> int:
         """生成递增消息 id。
@@ -791,10 +793,22 @@ class JscmdDaemon:
         """在已连接的 Chrome 中找到 JumpServer Luna 页面并附加 CDP session。
 
         dispatcher 运行时通过 dispatcher 发送请求，避免与 _recv_loop 竞争 recv()。
+        若已有有效 session，先探活复用，避免重复 attachToTarget 导致 session 丢失。
 
         @return True 找到并附加成功
         """
         use_disp = self._disp is not None and self._disp._running
+
+        # ---- 0. 若已有 session，先探活，能用则直接返回 True ----
+        if use_disp and self.session_id:
+            try:
+                probe = {"id": self._nid(), "method": "Runtime.evaluate",
+                         "params": {"expression": "1", "returnByValue": True},
+                         "sessionId": self.session_id}
+                await asyncio.wait_for(self._disp.request(probe), timeout=3.0)
+                return True  # session 仍有效，无需重新 attach
+            except Exception:
+                pass  # session 失效，继续重新查找
 
         # ---- 1. Target.getTargets ----
         get_msg = {"id": self._nid(), "method": "Target.getTargets", "params": {}}
@@ -855,7 +869,7 @@ class JscmdDaemon:
         if not self.session_id:
             print("[daemon] 附加 Luna session 失败。", file=sys.stderr)
             return False
-        print(f"[daemon] Luna session: {self.session_id}", file=sys.stderr)
+        print(f"[daemon] Luna session 已就绪: {self.session_id}", file=sys.stderr)
         return True
 
     async def setup_monitoring(self):
@@ -945,6 +959,20 @@ class JscmdDaemon:
         """重新检测 iframe contexts（标签开关后调用）。
 
         使用 CDPDispatcher 的事件监听机制，避免与 _recv_loop 冲突。
+        通过 _refresh_lock 保证同一时刻只有一个 refresh 在执行，
+        若已有 refresh 进行中则等待其完成后直接返回（不重复刷新）。
+
+        @return none
+        """
+        # 若已有 refresh 在跑，等它完成后直接返回（结果已是最新的）
+        if self._refresh_lock.locked():
+            async with self._refresh_lock:
+                return
+        async with self._refresh_lock:
+            await self._do_refresh_contexts()
+
+    async def _do_refresh_contexts(self):
+        """refresh_contexts 的实际实现，由 _refresh_lock 保护。
 
         @return none
         """
