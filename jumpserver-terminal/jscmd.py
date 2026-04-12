@@ -664,6 +664,8 @@ class JscmdDaemon:
         self._last_active: float = 0.0
         # 空闲超时秒数（0=永久常驻），由 daemon start 启动时写入，优先于配置文件
         self._idle_timeout_override: float = -1.0
+        # 启动时记录的 DevToolsActivePort 内容，用于监测 Chrome 重启
+        self._active_port_snapshot: str = ""
         # 解释器模式（per-tab）：{tab_idx: "shell"/"python"/"node"/...}
         self._interpreter_mode: dict = {}
         # 全局 exec 串行锁：防止并发 exec 竞争 _net_events 队列和全局输入焦点
@@ -740,6 +742,8 @@ class JscmdDaemon:
                 await self.connect(port, ws_path)
                 if await self.find_luna_page():
                     await self.setup_monitoring()
+                    # 更新快照，避免重连后立刻被再次触发
+                    self._active_port_snapshot = self._read_active_port_file()
                     print("[daemon] 重连成功", file=sys.stderr)
                     return True
                 self.browser_ws = None
@@ -977,6 +981,19 @@ class JscmdDaemon:
                 pass
 
         self.iframe_contexts = await self._order_contexts(contexts_raw)
+
+        # 如果刷新后仍为 0 个 tab，说明 Luna session 已失效（浏览器重新打开等情况）
+        # 自动重新探测 Luna page，获取新 session 后再刷新一次
+        if not self.iframe_contexts:
+            print("[daemon] refresh 后 tab 数为 0，尝试重新探测 Luna session...",
+                  file=sys.stderr)
+            if await self.find_luna_page():
+                print("[daemon] Luna session 已更新，重新刷新 tab 列表", file=sys.stderr)
+                # 递归调用一次（find_luna_page 已更新 session_id，重新收集 context）
+                await self.refresh_contexts()
+            else:
+                print("[daemon] 未找到 Luna 页面，请确认浏览器已打开 JumpServer",
+                      file=sys.stderr)
 
     async def detect_active_tab(self) -> int:
         """检测当前活跃（可见）的 terminal 标签索引（0-based）。
@@ -1238,11 +1255,23 @@ class JscmdDaemon:
         @return 命令输出（已剥离 ANSI 转义），超时时返回已收到的部分输出并标注
         """
         if tab_idx >= len(self.iframe_contexts):
-            return (f"[ERROR] 标签 #{tab_idx + 1} 不存在"
-                    f"（共 {len(self.iframe_contexts)} 个标签）")
+            # tab 不存在时先刷新（可能浏览器新开了标签或 Luna session 失效）
+            print(f"[daemon] 标签 #{tab_idx + 1} 不在缓存中"
+                  f"（共 {len(self.iframe_contexts)} 个），自动刷新...",
+                  file=sys.stderr)
+            await self.refresh_contexts()
+            if tab_idx >= len(self.iframe_contexts):
+                return (f"[ERROR] 标签 #{tab_idx + 1} 不存在"
+                        f"（共 {len(self.iframe_contexts)} 个标签），"
+                        f"请确认浏览器中已打开对应终端")
 
         # 串行锁：防止并发 exec 竞争全局输入焦点和 _net_events 队列
-        async with self._exec_lock:
+        # 等锁最多比命令超时多 5s，超时则报错而非无限等待
+        try:
+            await asyncio.wait_for(self._exec_lock.acquire(), timeout=timeout + 5)
+        except asyncio.TimeoutError:
+            return "[ERROR] 另一条命令正在执行中，请稍后重试"
+        try:
             # 检查当前活跃标签，不一致时才切换，避免不必要的 UI 操作
             active_idx = await self.detect_active_tab()
             if active_idx != tab_idx:
@@ -1336,6 +1365,8 @@ class JscmdDaemon:
             self._update_interpreter_mode(tab_idx, original_cmd, output_buf)
 
             return output
+        finally:
+            self._exec_lock.release()
 
     def _update_interpreter_mode(self, tab_idx: int,
                                    cmd: str, output_buf: str):
@@ -1635,7 +1666,7 @@ class JscmdDaemon:
         if cmd == "exec":
             tab_idx = req.get("tab")   # 0-based，None=自动检测
             command = req.get("command", "")
-            timeout = float(req.get("timeout", 30))
+            timeout = float(req.get("timeout", 15))
 
             if tab_idx is None:
                 tab_idx = await self.detect_active_tab()
@@ -1682,6 +1713,8 @@ class JscmdDaemon:
                 tab_idx = await self.detect_active_tab()
 
             if tab_idx >= len(self.iframe_contexts):
+                await self.refresh_contexts()
+            if tab_idx >= len(self.iframe_contexts):
                 return {"ok": False,
                         "error": f"标签 #{tab_idx + 1} 不存在"}
 
@@ -1692,32 +1725,96 @@ class JscmdDaemon:
 
         return {"ok": False, "error": f"未知命令: {cmd}"}
 
-    async def _heartbeat(self):
-        """后台心跳任务：每 25s 发一次 Browser.getVersion 维持 Chrome WS 连接。
+    @staticmethod
+    def _read_active_port_file() -> str:
+        """读取 DevToolsActivePort 文件内容，返回空串表示文件不存在。
 
-        不依赖 websockets 的 ping/pong（Chrome CDP 不回 pong），
-        改用 CDP 协议层的消息来防止连接被中间件或 Chrome 超时关闭。
-        若连续 2 次心跳均失败，主动触发重连，避免下次请求时才发现断线。
+        @return 文件原始内容字符串
+        """
+        for pattern in (
+            "~/Library/Application Support/Google/Chrome/DevToolsActivePort",
+            "~/Library/Application Support/Chromium/DevToolsActivePort",
+            "~/.config/google-chrome/DevToolsActivePort",
+        ):
+            p = os.path.expanduser(pattern)
+            if os.path.exists(p):
+                try:
+                    return open(p).read().strip()
+                except OSError:
+                    pass
+        return ""
+
+    async def _heartbeat(self):
+        """后台心跳任务：每 20s 检测一次 Chrome 连接存活状态。
+
+        两种检测机制：
+        1. DevToolsActivePort 变更检测：Chrome 重启后文件内容（端口/路径）会变，
+           一旦检测到变化立即主动重连，无需等待命令超时。
+        2. CDP 响应心跳：发送 Browser.getVersion 并等待回包（5s 超时），
+           仅靠 send 不够——Chrome 重启后 TCP 缓冲区可能短暂不报错。
+           连续 2 次无响应则触发重连。
 
         @return none
         """
         fail_count = 0
         while True:
-            await asyncio.sleep(25)
+            await asyncio.sleep(20)
             if self.browser_ws is None:
                 continue
+
+            # --- 机制 0：Luna session 存活检查（每 3 次心跳 = 60s 检查一次）---
+            if fail_count == 0 and hasattr(self, "_hb_tick"):
+                self._hb_tick = getattr(self, "_hb_tick", 0) + 1
+                if self._hb_tick % 3 == 0 and self.session_id:
+                    try:
+                        # 发一个无害的 Runtime.evaluate 给 Luna session
+                        m = {"id": self._nid(), "method": "Runtime.evaluate",
+                             "params": {"expression": "1", "returnByValue": True},
+                             "sessionId": self.session_id}
+                        await asyncio.wait_for(self._disp.request(m), timeout=3.0)
+                    except Exception:
+                        print("[daemon] Luna session 已失效，重新探测...",
+                              file=sys.stderr)
+                        if await self.find_luna_page():
+                            await self.refresh_contexts()
+                            print(f"[daemon] Luna session 已恢复，"
+                                  f"检测到 {len(self.iframe_contexts)} 个标签",
+                                  file=sys.stderr)
+            else:
+                self._hb_tick = 0
+
+            # --- 机制 1：DevToolsActivePort 变更检测 ---
+            current_snapshot = self._read_active_port_file()
+            if (self._active_port_snapshot
+                    and current_snapshot
+                    and current_snapshot != self._active_port_snapshot):
+                print(
+                    "[daemon] 检测到 Chrome 重启（DevToolsActivePort 已变更），"
+                    "主动重连...",
+                    file=sys.stderr)
+                self._active_port_snapshot = current_snapshot
+                await self.reconnect()
+                fail_count = 0
+                continue
+
+            # --- 机制 2：CDP 响应心跳（发送 + 等回包）---
             try:
-                mid = self._nid()
-                await asyncio.wait_for(
-                    self.browser_ws.send(json.dumps(
-                        {"id": mid, "method": "Browser.getVersion", "params": {}}
-                    )), timeout=5)
+                hb_msg = {"id": self._nid(),
+                          "method": "Browser.getVersion", "params": {}}
+                if self._disp:
+                    # 通过 dispatcher 发送并等待回包，真正验证连接活跃
+                    await asyncio.wait_for(
+                        self._disp.request(hb_msg), timeout=5)
+                else:
+                    # dispatcher 未就绪时，只 send（保守策略）
+                    await asyncio.wait_for(
+                        self.browser_ws.send(json.dumps(hb_msg)), timeout=5)
                 fail_count = 0
             except Exception as e:
                 fail_count += 1
-                print(f"[daemon] 心跳失败({fail_count}/2): {e}", file=sys.stderr)
+                print(f"[daemon] 心跳无响应({fail_count}/2): {e}", file=sys.stderr)
                 if fail_count >= 2:
-                    print("[daemon] 连续心跳失败，主动重连...", file=sys.stderr)
+                    print("[daemon] 连续心跳无响应，主动重连...", file=sys.stderr)
                     await self.reconnect()
                     fail_count = 0
 
@@ -1779,40 +1876,107 @@ class JscmdDaemon:
         async with server:
             await server.serve_forever()
 
+    async def _ping_chrome(self, timeout: float = 3.0) -> bool:
+        """快速检测 Chrome CDP 连接是否存活。
+
+        通过 dispatcher 发送 Browser.getVersion 并等待回包；
+        超时或异常均视为连接已死。
+
+        @param[in] timeout 等待回包的超时秒数
+        @return True=连接存活，False=连接已死
+        """
+        if self.browser_ws is None:
+            return False
+        try:
+            msg = {"id": self._nid(),
+                   "method": "Browser.getVersion", "params": {}}
+            if self._disp:
+                await asyncio.wait_for(self._disp.request(msg), timeout=timeout)
+            else:
+                await asyncio.wait_for(
+                    self.browser_ws.send(json.dumps(msg)), timeout=timeout)
+            return True
+        except Exception:
+            return False
+
     async def _handle_client(self, reader: asyncio.StreamReader,
                               writer: asyncio.StreamWriter):
-        """处理单个 socket 客户端连接，遇到 WS 错误时自动重连后重试。
+        """处理单个 socket 客户端连接，自动感知断线并重连后重试。
 
-        每次请求都会更新 _last_active 以重置空闲计时器。
+        触发重连的两种情形：
+        1. 请求执行期间抛出 WS 异常（立即触发）
+        2. exec 命令超时且 ping 确认连接已死（超时后触发）
+
+        重连成功后自动重试原始请求一次，用户无需手动重启 daemon。
+        Chrome 若弹出「允许」弹窗，错误信息会提示用户点击。
 
         @param[in] reader 异步流读取器
         @param[in] writer 异步流写入器
         @return none
         """
         self._last_active = asyncio.get_event_loop().time()
+        resp = {"ok": False, "error": "internal error"}
         try:
             data = await asyncio.wait_for(reader.read(65536), timeout=60)
             req = json.loads(data.decode())
-            try:
-                resp = await self.handle_request(req)
-            except Exception as e:
-                # WS 连接断开时尝试重连后重试一次
-                err_str = str(e).lower()
-                if any(k in err_str for k in
-                       ("1011", "1006", "closed", "connect", "websocket")):
-                    print(f"[daemon] WS 错误: {e}，尝试重连...", file=sys.stderr)
-                    if await self.reconnect():
-                        resp = await self.handle_request(req)
-                    else:
-                        resp = {"ok": False,
-                                "error": "Chrome WS 断线且重连失败，请重启 daemon"}
-                else:
-                    resp = {"ok": False, "error": str(e)}
+            resp = await self._handle_request_guarded(req)
         except Exception as e:
             resp = {"ok": False, "error": str(e)}
-        writer.write(json.dumps(resp).encode())
-        await writer.drain()
+        try:
+            writer.write(json.dumps(resp).encode())
+            await writer.drain()
+        except Exception:
+            pass
         writer.close()
+
+    async def _handle_request_guarded(self, req: dict) -> dict:
+        """执行请求并处理 WS 断线自动重连逻辑，供 _handle_client 用 Task 包装调用。
+
+        相比直接调用 handle_request 多了：
+        - exec 超时后 ping 检测 + 自动重连重试
+        - WS 异常立即重连重试
+        - 重连失败时返回明确的用户提示
+
+        @param[in] req 请求 dict
+        @return 响应 dict
+        """
+        try:
+            resp = await self.handle_request(req)
+
+            # exec 超时 → 立刻检测连接，死了就重连重试
+            if (req.get("cmd") == "exec"
+                    and isinstance(resp.get("output", ""), str)
+                    and resp["output"].startswith("[TIMEOUT]")):
+                print("[daemon] exec 超时，检测 Chrome 连接状态...", file=sys.stderr)
+                if not await self._ping_chrome():
+                    print("[daemon] Chrome 连接已死，触发自动重连...", file=sys.stderr)
+                    if await self.reconnect():
+                        print("[daemon] 重连成功，重试命令...", file=sys.stderr)
+                        resp = await self.handle_request(req)
+                    else:
+                        resp = {"ok": False, "error": (
+                            "Chrome 连接已断开且重连失败。\n"
+                            "  请检查 Chrome 是否有「允许远程调试」弹窗并点击「允许」，\n"
+                            "  或手动执行: jscmd daemon start")}
+            return resp
+
+        except asyncio.CancelledError:
+            raise  # 让 _handle_client 感知取消
+        except Exception as e:
+            err_str = str(e).lower()
+            is_ws_err = any(k in err_str for k in
+                            ("1011", "1006", "closed", "connect",
+                             "websocket", "connection"))
+            if is_ws_err:
+                print(f"[daemon] WS 错误: {e}，自动重连...", file=sys.stderr)
+                if await self.reconnect():
+                    print("[daemon] 重连成功，重试命令...", file=sys.stderr)
+                    return await self.handle_request(req)
+                return {"ok": False, "error": (
+                    "Chrome 连接断开且重连失败。\n"
+                    "  请检查 Chrome 是否有「允许远程调试」弹窗并点击「允许」，\n"
+                    "  或手动执行: jscmd daemon start")}
+            return {"ok": False, "error": str(e)}
 
 
 # ---------------------------------------------------------------------------
@@ -1899,6 +2063,9 @@ async def _daemon_main(idle_timeout: float = -1.0):
         sys.exit(1)
 
     await daemon.setup_monitoring()
+
+    # 记录启动时的 DevToolsActivePort 快照，用于后续检测 Chrome 重启
+    daemon._active_port_snapshot = JscmdDaemon._read_active_port_file()
 
     # 写 PID 文件
     with open(DAEMON_PID_FILE, "w") as f:
