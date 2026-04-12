@@ -1094,7 +1094,14 @@ class JscmdDaemon:
                .map((f,idx)=>({idx:idx, src:f.src, active:f.offsetWidth>0})))"""
         result = await self._eval(js, 0, timeout=5.0)
         if not result:
-            return []
+            # JS eval 失败可能是 Luna session 过期，自动重新获取
+            print("[daemon] _live_tab_info: DOM 查询无结果，尝试重新获取 Luna session...",
+                  file=sys.stderr)
+            if await self.find_luna_page():
+                await self.refresh_contexts()
+                result = await self._eval(js, 0, timeout=5.0)
+            if not result:
+                return []
         try:
             items = json.loads(result)
         except Exception:
