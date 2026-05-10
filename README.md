@@ -8,6 +8,36 @@ Cursor、Codex CLI、Claude Code 均支持相同的 SKILL.md 格式。
 
 ## Skills 一览
 
+### `chrome-cdp-ws-daemon` — Chrome CDP WebSocket 守护进程
+
+所有需要 CDP 的 skill 共用一个持久连接，用户只需授权一次。避免每个 skill 各自建立 CDP 连接导致频繁授权弹窗。
+
+```
+┌──────────────┐   Unix Socket    ┌──────────────────┐   WebSocket   ┌─────────┐
+│  Skill A     │ ──────────────── │  cdp daemon      │ ───────────── │ Chrome  │
+│  Skill B     │   (并发安全)     │  (后台常驻)      │  (持久连接)   │ Browser │
+│  Skill C     │ ──────────────── │  ~/.chrome-cdp-daemon/cdp.sock   │         │
+└──────────────┘                  └──────────────────┘               └─────────┘
+```
+
+**特性**：
+- daemon 后台常驻，持有持久 WebSocket 连接
+- 所有 skill 通过 Unix Socket 请求 CDP 服务，线程安全
+- 心跳保活：每 30 秒检测连接健康，断线自动重连
+- 首次启动弹一次授权框，后续完全静默
+
+```bash
+DAEMON=~/.cursor/skills/chrome-cdp-ws-daemon/scripts/daemon.py
+
+python $DAEMON start    # 启动 daemon
+python $DAEMON status   # 查看状态
+python $DAEMON stop     # 停止
+```
+
+→ **[详细文档](chrome-cdp-ws-daemon/SKILL.md)**：架构说明、其他 skill 如何集成、运行时文件
+
+---
+
 ### `iterm2-exec` — 向 iTerm2 会话发命令
 
 让 Agent 向本机 iTerm2 中**已有的标签页**（含 SSH、docker exec 等远端会话）发送命令并取回输出，无需新建连接，无需在远端安装任何工具。
@@ -111,6 +141,7 @@ SKILLS_DIR=~/.cursor/skills   # 其他工具替换路径
 git clone https://github.com/yangyongyongyong/skills /tmp/cursor-skills-repo
 
 # 只复制需要的 Skill
+cp -r /tmp/cursor-skills-repo/chrome-cdp-ws-daemon "$SKILLS_DIR/"
 cp -r /tmp/cursor-skills-repo/iterm2-exec "$SKILLS_DIR/"
 cp -r /tmp/cursor-skills-repo/jupyterlab-terminal "$SKILLS_DIR/"
 cp -r /tmp/cursor-skills-repo/jumpserver-terminal "$SKILLS_DIR/"
@@ -164,6 +195,11 @@ enabled = true
 │   ├── iterm2_skill.gif
 │   ├── jumpserver_skill.gif
 │   └── jupyter_skill.gif
+├── chrome-cdp-ws-daemon/
+│   ├── SKILL.md              # Agent 触发规则
+│   └── scripts/
+│       ├── daemon.py         # 守护进程
+│       └── cdp_client.py     # 客户端 SDK
 ├── iterm2-exec/
 │   ├── SKILL.md              # Agent 触发规则
 │   ├── README.md             # 详细参数与案例文档
