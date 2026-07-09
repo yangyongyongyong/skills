@@ -53,6 +53,7 @@ from cdp_client import (  # noqa: E402
     get_text,
     get_url,
     get_title,
+    screenshot,
     network_capture_start,
     network_capture_stop,
     network_fetch,
@@ -63,6 +64,13 @@ from cdp_client import (  # noqa: E402
     find_icon,
     click_icon,
     scan_tooltips,
+    open_tab,
+    close_tab,
+    activate,
+    tab_bind,
+    tab_get,
+    tab_list,
+    tab_remove,
 )
 
 
@@ -70,7 +78,7 @@ from cdp_client import (  # noqa: E402
 # Phase 1: 页面列表
 # ---------------------------------------------------------------------------
 
-def list_pages(auto_start: bool = False) -> list[dict]:
+def list_pages(auto_start: bool = False, instance: str = "") -> list[dict]:
     """返回当前所有打开的 page 类型 target。
 
     读取 daemon 内存中的 pages 缓存，不发新 CDP 请求，极快。
@@ -78,8 +86,8 @@ def list_pages(auto_start: bool = False) -> list[dict]:
     :param auto_start: daemon 未运行时是否自动启动
     :return: [{"targetId": ..., "url": ..., "title": ..., "type": "page"}, ...]
     """
-    ensure_daemon(auto_start=auto_start)
-    resp = _send_to_daemon({"action": "list_pages"})
+    resolved_instance = ensure_daemon(auto_start=auto_start, instance=instance)
+    resp = _send_to_daemon({"action": "list_pages"}, instance=resolved_instance)
     if not resp.get("ok"):
         raise RuntimeError(f"list_pages failed: {resp.get('error', '?')}")
     return resp.get("pages", [])
@@ -89,7 +97,7 @@ def list_pages(auto_start: bool = False) -> list[dict]:
 # Phase 1: 活动页面（macOS only）
 # ---------------------------------------------------------------------------
 
-def get_active_page(auto_start: bool = False) -> dict | None:
+def get_active_page(auto_start: bool = False, instance: str = "") -> dict | None:
     """获取用户当前活动的 Chrome tab（macOS only）。
 
     流程：
@@ -104,8 +112,8 @@ def get_active_page(auto_start: bool = False) -> dict | None:
     if sys.platform != "darwin":
         raise RuntimeError("get_active_page() is only supported on macOS")
 
-    ensure_daemon(auto_start=auto_start)
-    resp = _send_to_daemon({"action": "active_page"}, timeout=8)
+    resolved_instance = ensure_daemon(auto_start=auto_start, instance=instance)
+    resp = _send_to_daemon({"action": "active_page"}, timeout=25, instance=resolved_instance)
     if not resp.get("ok"):
         raise RuntimeError(f"get_active_page failed: {resp.get('error', '?')}")
     return resp.get("page")

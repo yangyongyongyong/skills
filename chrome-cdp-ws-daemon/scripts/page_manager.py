@@ -14,10 +14,17 @@ from __future__ import annotations
 
 import json
 import os
+import base64
+import re
+import struct
 import subprocess
 import sys
 import threading
 import time
+import tempfile
+import zlib
+import urllib.parse
+from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -51,7 +58,10 @@ JS_SNAPSHOT = r"""
         const tag = el.tagName.toLowerCase();
 
         // 1. id（最可靠）
-        if (el.id) return '#' + CSS.escape(el.id);
+        if (el.id) {
+            const idSel = '#' + CSS.escape(el.id);
+            if (document.querySelectorAll(idSel).length === 1) return idSel;
+        }
 
         // 2. data-testid / data-cy / data-test
         for (const attr of ['data-testid', 'data-cy', 'data-test']) {
@@ -163,6 +173,29 @@ JS_SNAPSHOT = r"""
                 const checked = el.checked;
                 const selector = buildSelector(el);
 
+                // 额外标签来源（#25：匿名 button 补充）
+                const titleAttr   = el.getAttribute('title') || '';
+                const nzTooltip   = el.getAttribute('nz-tooltip') || el.getAttribute('nzTooltipTitle') || '';
+                const dataTestId  = el.getAttribute('data-testid') || el.getAttribute('data-test-id') || '';
+                const ariaDesc    = (() => {
+                    const by = el.getAttribute('aria-describedby');
+                    if (!by) return '';
+                    const d = document.getElementById(by);
+                    return d ? (d.textContent || '').trim().substring(0, 40) : '';
+                })();
+                // SVG 内嵌 <title>（图标按钮最常用）
+                const svgTitle = (() => {
+                    const t = el.querySelector('svg > title, svg title');
+                    return t ? (t.textContent || '').trim().substring(0, 40) : '';
+                })();
+                // anticon class 名称（Ant Design 图标，如 anticon-close → "close"）
+                const anticonName = (() => {
+                    const icon = el.querySelector('[class*="anticon-"]') || (el.className && el.className.includes && el.className.includes('anticon-') ? el : null);
+                    if (!icon) return '';
+                    const m = (icon.className || '').match(/anticon-([a-z0-9\-]+)/);
+                    return m ? m[1] : '';
+                })();
+
                 // 查找关联 label（input/select/textarea）
                 let labelText = '';
                 if (tag === 'input' || tag === 'select' || tag === 'textarea') {
@@ -199,19 +232,30 @@ JS_SNAPSHOT = r"""
                     }
                 }
 
-                // 可读描述
+                // 可读描述：按优先级取最优标签
+                // 优先级：ariaLabel > text > titleAttr > nzTooltip > svgTitle > anticonName > ariaDesc > dataTestId
+                const bestLabel = ariaLabel || (text.length <= 40 ? text : '') || titleAttr || nzTooltip || svgTitle || anticonName || ariaDesc || dataTestId;
+
                 let desc = '[' + tag;
                 if (type) desc += ' type="' + type + '"';
                 if (role) desc += ' role="' + role + '"';
                 desc += ']';
                 if (labelText) desc += ' label="' + labelText + '"';
                 if (placeholder) desc += ' "' + placeholder + '"';
-                else if (ariaLabel) desc += ' "' + ariaLabel + '"';
-                else if (text && text.length <= 40) desc += ' "' + text + '"';
+                else if (bestLabel) desc += ' "' + bestLabel + '"';
+
+                let domDepth = 0;
+                let depthNode = el;
+                while (depthNode && depthNode !== root && depthNode !== document) {
+                    domDepth++;
+                    depthNode = depthNode.parentElement;
+                }
 
                 elements.push({
                     tag, type, role, id, name, placeholder, ariaLabel,
                     text, value, checked, selector, desc, href, labelText,
+                    titleAttr, nzTooltip, svgTitle, anticonName, dataTestId,
+                    depth: domDepth,
                     rect: {x: rect.x, y: rect.y, w: rect.width, h: rect.height},
                 });
             });
@@ -285,12 +329,142 @@ JS_SELECT = r"""
 # 通用自定义下拉框选择（Ant Design / Element UI / Arco 等）
 # 策略：点击触发元素 → 等弹出层出现 → 按文本匹配选项 → 点击选中
 JS_CUSTOM_SELECT = r"""
-(function(selector, label) {
+(function(selector, label, searchText) {
     const el = document.querySelector(selector);
     if (!el) return JSON.stringify({error: 'element not found: ' + selector});
 
     // 1. 找到 Select 容器（向上查找 .ant-select / .el-select / [class*="select"] 等）
     const container = el.closest('.ant-select, .el-select, .arco-select, [class*="select-wrapper"]') || el;
+
+    function normalizeText(text) {
+        return String(text || '').replace(/\s+/g, ' ').trim();
+    }
+
+    function getVisibleDropdowns() {
+        const dropdowns = document.querySelectorAll(
+            '.ant-select-dropdown, .el-select-dropdown, .arco-select-popup, ' +
+            '.ant-cascader-dropdown, [class*="select-dropdown"], [class*="dropdown-menu"], ' +
+            '[role="listbox"]'
+        );
+        return Array.from(dropdowns).filter(dd => {
+            const style = getComputedStyle(dd);
+            if (style.display === 'none' || style.visibility === 'hidden') return false;
+            if (dd.classList.contains('ant-select-dropdown-hidden')) return false;
+            const rect = dd.getBoundingClientRect();
+            return rect.width > 0 && rect.height > 0;
+        });
+    }
+
+    function getOptionNodes(dropdown) {
+        return dropdown.querySelectorAll(
+            '.ant-select-item-option, .el-select-dropdown__item, .arco-select-option, ' +
+            '[class*="option"], li[role="option"], div[role="option"]'
+        );
+    }
+
+    function getSelectedText(fallbackText) {
+        const selItem = container.querySelector(
+            '.ant-select-selection-item, .el-input__inner, .arco-select-view-value, ' +
+            '[class*="selection-item"], [class*="select-view-value"]'
+        );
+        return normalizeText(selItem ? selItem.textContent : fallbackText);
+    }
+
+    function findSearchInput() {
+        const candidates = [];
+
+        function resolveEditable(node) {
+            if (!node) return null;
+            if (node.matches && node.matches('input, textarea, [contenteditable="true"]')) return node;
+            return node.querySelector
+                ? node.querySelector('input, textarea, [contenteditable="true"]')
+                : null;
+        }
+
+        function pushCandidate(node) {
+            const editable = resolveEditable(node);
+            if (!editable || candidates.includes(editable)) return;
+            if (editable.disabled || editable.readOnly) return;
+            const rect = editable.getBoundingClientRect();
+            if (rect.width === 0 && rect.height === 0) return;
+            candidates.push(editable);
+        }
+
+        if (document.activeElement && (document.activeElement.matches('input, textarea, [contenteditable="true"]') || document.activeElement.getAttribute('role') === 'combobox')) {
+            pushCandidate(document.activeElement);
+        }
+
+        container.querySelectorAll(
+            'input, textarea, [contenteditable="true"], [role="combobox"], ' +
+            '.ant-select-selection-search-input, .el-select__input, .arco-select-view-input'
+        ).forEach(pushCandidate);
+
+        getVisibleDropdowns().forEach(dd => {
+            dd.querySelectorAll(
+                'input, textarea, [contenteditable="true"], [role="combobox"], ' +
+                '.ant-select-selection-search-input, .el-select__input, .arco-select-view-input'
+            ).forEach(pushCandidate);
+        });
+
+        return candidates[0] || null;
+    }
+
+    function setSearchValue(input, text) {
+        const normalized = String(text || '');
+        input.focus();
+        input.dispatchEvent(new MouseEvent('mousedown', {bubbles: true, cancelable: true}));
+        if (typeof input.click === 'function') input.click();
+
+        if (input.isContentEditable) {
+            input.textContent = normalized;
+            input.dispatchEvent(new Event('input', {bubbles: true}));
+            input.dispatchEvent(new Event('change', {bubbles: true}));
+            return;
+        }
+
+        const tag = (input.tagName || '').toLowerCase();
+        const proto = tag === 'textarea'
+            ? HTMLTextAreaElement.prototype
+            : HTMLInputElement.prototype;
+        const setter = Object.getOwnPropertyDescriptor(proto, 'value')?.set;
+        if (setter) setter.call(input, '');
+        else input.value = '';
+        const tracker = input._valueTracker;
+        if (tracker) tracker.setValue('');
+        if (setter) setter.call(input, normalized);
+        else input.value = normalized;
+        input.dispatchEvent(new KeyboardEvent('keydown', {
+            key: normalized.slice(-1) || ' ',
+            bubbles: true,
+            cancelable: true,
+        }));
+        input.dispatchEvent(new Event('input', {bubbles: true}));
+        input.dispatchEvent(new Event('change', {bubbles: true}));
+        input.dispatchEvent(new KeyboardEvent('keyup', {
+            key: normalized.slice(-1) || ' ',
+            bubbles: true,
+            cancelable: true,
+        }));
+    }
+
+    function tryPickOption() {
+        const wanted = normalizeText(label);
+        const dropdowns = getVisibleDropdowns();
+        for (const dd of dropdowns) {
+            const options = getOptionNodes(dd);
+            for (const opt of options) {
+                const text = normalizeText(opt.textContent);
+                if (text === wanted) return {opt, text, method: 'custom_select'};
+            }
+            for (const opt of options) {
+                const text = normalizeText(opt.textContent);
+                if (text.includes(wanted) || wanted.includes(text)) {
+                    return {opt, text, method: 'custom_select_fuzzy'};
+                }
+            }
+        }
+        return null;
+    }
 
     // 2. 点击触发下拉（Ant Design 监听 mousedown）
     el.focus();
@@ -300,71 +474,56 @@ JS_CUSTOM_SELECT = r"""
     // 3. 等下拉弹出并查找选项（异步，最多等 500ms）
     return new Promise(function(resolve) {
         let attempts = 0;
+        let searched = false;
+        const query = normalizeText(searchText || label);
+
         function trySelect() {
             attempts++;
-            // 查找所有可见的下拉弹出层
-            const dropdowns = document.querySelectorAll(
-                '.ant-select-dropdown, .el-select-dropdown, .arco-select-popup, ' +
-                '.ant-cascader-dropdown, [class*="select-dropdown"], [class*="dropdown-menu"]'
-            );
-            for (const dd of dropdowns) {
-                const style = getComputedStyle(dd);
-                if (style.display === 'none' || style.visibility === 'hidden') continue;
-                if (dd.classList.contains('ant-select-dropdown-hidden')) continue;
-                // 遍历选项
-                const options = dd.querySelectorAll(
-                    '.ant-select-item-option, .el-select-dropdown__item, .arco-select-option, ' +
-                    '[class*="option"], li[role="option"], div[role="option"]'
-                );
-                for (const opt of options) {
-                    const text = opt.textContent.trim();
-                    if (text === label) {
-                        opt.scrollIntoView({block: 'center', behavior: 'instant'});
-                        opt.click();
-                        // 验证选中结果
-                        setTimeout(function() {
-                            const selItem = container.querySelector(
-                                '.ant-select-selection-item, .el-input__inner, .arco-select-view-value, [class*="selection-item"]'
-                            );
-                            const result = selItem ? selItem.textContent.trim() : text;
-                            resolve(JSON.stringify({ok: true, selected: result, method: 'custom_select'}));
-                        }, 100);
-                        return;
-                    }
-                }
-                // 没找到精确匹配，试模糊匹配
-                for (const opt of options) {
-                    const text = opt.textContent.trim();
-                    if (text.includes(label) || label.includes(text)) {
-                        opt.scrollIntoView({block: 'center', behavior: 'instant'});
-                        opt.click();
-                        setTimeout(function() {
-                            const selItem = container.querySelector(
-                                '.ant-select-selection-item, .el-input__inner, .arco-select-view-value, [class*="selection-item"]'
-                            );
-                            const result = selItem ? selItem.textContent.trim() : text;
-                            resolve(JSON.stringify({ok: true, selected: result, method: 'custom_select_fuzzy'}));
-                        }, 100);
-                        return;
-                    }
+            const matched = tryPickOption();
+            if (matched) {
+                matched.opt.scrollIntoView({block: 'center', behavior: 'instant'});
+                matched.opt.click();
+                setTimeout(function() {
+                    resolve(JSON.stringify({
+                        ok: true,
+                        selected: getSelectedText(matched.text),
+                        method: searched ? matched.method + '_search' : matched.method,
+                        searched: searched,
+                        searchText: searched ? query : '',
+                    }));
+                }, 100);
+                return;
+            }
+
+            if (!searched && query) {
+                const searchInput = findSearchInput();
+                if (searchInput) {
+                    searched = true;
+                    setSearchValue(searchInput, query);
+                    setTimeout(trySelect, 180);
+                    return;
                 }
             }
-            if (attempts < 5) {
-                setTimeout(trySelect, 100);
+
+            if (attempts < 7) {
+                setTimeout(trySelect, 120);
             } else {
                 // 收集可用选项返回
                 const allOpts = [];
-                for (const dd of dropdowns) {
-                    if (dd.classList.contains('ant-select-dropdown-hidden')) continue;
-                    const options = dd.querySelectorAll(
-                        '.ant-select-item-option, .el-select-dropdown__item, .arco-select-option, ' +
-                        '[class*="option"], li[role="option"], div[role="option"]'
-                    );
+                for (const dd of getVisibleDropdowns()) {
+                    const options = getOptionNodes(dd);
                     for (const opt of options) {
-                        allOpts.push(opt.textContent.trim());
+                        const text = normalizeText(opt.textContent);
+                        if (text) allOpts.push(text);
                     }
                 }
-                resolve(JSON.stringify({error: 'option not found', label: label, available: allOpts.slice(0, 20)}));
+                resolve(JSON.stringify({
+                    error: 'option not found',
+                    label: label,
+                    searched: searched,
+                    searchText: searched ? query : '',
+                    available: allOpts.slice(0, 20),
+                }));
             }
         }
         setTimeout(trySelect, 100);
@@ -443,6 +602,16 @@ JS_SCROLL = r"""
     else target.scrollBy(opts);
     return JSON.stringify({ok: true, direction, amount: px});
 })
+"""
+
+JS_LIVE_PAGE_PROBE = r"""
+(() => JSON.stringify({
+    title: document.title || '',
+    url: location.href || '',
+    hasFocus: !!document.hasFocus(),
+    visibilityState: document.visibilityState || '',
+    hidden: !!document.hidden,
+}))()
 """
 
 # 兜底查找：当 CSS selector 失效时，用 tag + text + href 重新定位元素
@@ -558,6 +727,10 @@ class PageManager:
         self._net_capture_buffer: dict[str, list] = {}
         # requestId -> {url, method, headers, postData, type, timestamp, ...}
         self._net_request_map: dict[str, dict] = {}
+        # sessionId -> 最近一次网络事件时间戳，用于 idle 判定
+        self._net_last_event_at: dict[str, float] = {}
+        # sessionId -> 本轮抓包开始时间
+        self._net_capture_started_at: dict[str, float] = {}
         self._net_lock = threading.Lock()
 
         # ---- follow 模式（跟踪新 tab）----
@@ -582,6 +755,117 @@ class PageManager:
         # Chrome 扩展 service worker targetId 缓存（用于调用 chrome.tabs/tabGroups API）
         self._ext_sw_tabs: str = ""       # 有 chrome.tabs.group 的 SW targetId
         self._ext_sw_tabgroups: str = ""  # 有 chrome.tabGroups.update 的 SW targetId
+
+        # CDP 新开页面统一进入固定自动化分组，方便用户识别这些页面来自自动化工具
+        self._automation_group_name = "CDP自动化"
+        self._automation_group_color = "purple"
+
+        # ---- 标签页别名 ----
+        # name -> targetId；用于避免按标题/URL 模糊匹配误命中
+        self._tab_aliases: dict[str, str] = {}
+        self._tab_aliases_lock = threading.Lock()
+        self._tab_aliases_path = Path.home() / ".chrome-cdp-daemon" / "tab_aliases.json"
+        self._load_tab_aliases()
+
+    def _load_tab_aliases(self) -> None:
+        try:
+            if not self._tab_aliases_path.exists():
+                return
+            data = json.loads(self._tab_aliases_path.read_text(encoding="utf-8"))
+            if isinstance(data, dict):
+                with self._tab_aliases_lock:
+                    self._tab_aliases = {
+                        str(k): str(v)
+                        for k, v in data.items()
+                        if isinstance(k, str) and isinstance(v, str)
+                    }
+        except Exception:
+            pass
+
+    def _save_tab_aliases(self) -> None:
+        try:
+            self._tab_aliases_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._tab_aliases_lock:
+                payload = dict(self._tab_aliases)
+            self._tab_aliases_path.write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+        except Exception:
+            pass
+
+    def _validate_tab_alias(self, name: str) -> str:
+        alias = (name or "").strip()
+        if not alias:
+            raise RuntimeError("alias 不能为空")
+        if not re.fullmatch(r"[A-Za-z0-9._-]{1,64}", alias):
+            raise RuntimeError("alias 仅支持字母、数字、点、下划线、中划线，长度 1-64")
+        return alias
+
+    def _get_bound_target(self, alias: str) -> str:
+        alias = self._validate_tab_alias(alias)
+        self._load_tab_aliases()
+        with self._tab_aliases_lock:
+            target_id = self._tab_aliases.get(alias, "")
+        if not target_id:
+            raise RuntimeError(f"tab alias 不存在: {alias}")
+
+        pages = self._cdp.get_pages()
+        if any(p.get("targetId") == target_id for p in pages):
+            return target_id
+
+        with self._tab_aliases_lock:
+            self._tab_aliases.pop(alias, None)
+        self._save_tab_aliases()
+        raise RuntimeError(f"tab alias 已失效: {alias}，对应页面可能已关闭，请重新绑定")
+
+    def _remove_aliases_for_target(self, target_id: str) -> list[str]:
+        removed: list[str] = []
+        with self._tab_aliases_lock:
+            for name, tid in list(self._tab_aliases.items()):
+                if tid == target_id:
+                    removed.append(name)
+                    del self._tab_aliases[name]
+        if removed:
+            self._save_tab_aliases()
+        return removed
+
+    def bind_tab(self, name: str, target: str = "active") -> dict:
+        alias = self._validate_tab_alias(name)
+        target_id = self.resolve_target(target)
+        with self._tab_aliases_lock:
+            self._tab_aliases[alias] = target_id
+        self._save_tab_aliases()
+        info = self._get_page_info(target_id)
+        return {"ok": True, "alias": alias, **info}
+
+    def get_tab_binding(self, name: str) -> dict:
+        alias = self._validate_tab_alias(name)
+        target_id = self._get_bound_target(alias)
+        info = self._get_page_info(target_id)
+        return {"ok": True, "alias": alias, **info}
+
+    def list_tab_bindings(self) -> dict:
+        self._load_tab_aliases()
+        with self._tab_aliases_lock:
+            items = list(self._tab_aliases.keys())
+        bindings = []
+        for alias in items:
+            try:
+                bindings.append(self.get_tab_binding(alias))
+            except Exception:
+                continue
+        bindings.sort(key=lambda item: item.get("alias", ""))
+        return {"ok": True, "bindings": bindings, "count": len(bindings)}
+
+    def remove_tab_binding(self, name: str) -> dict:
+        alias = self._validate_tab_alias(name)
+        with self._tab_aliases_lock:
+            existed = alias in self._tab_aliases
+            target_id = self._tab_aliases.pop(alias, "")
+        if existed:
+            self._save_tab_aliases()
+        return {"ok": True, "alias": alias, "removed": existed, "targetId": target_id}
 
     # =================================================================
     # Session 管理
@@ -648,9 +932,12 @@ class PageManager:
             try:
                 sid = self._get_or_attach(tid)
                 self.page_call(tid, "Network.enable", {})
+                started_at = time.time()
                 with self._net_lock:
                     self._net_capture_active[sid] = True
                     self._net_capture_buffer.setdefault(sid, [])
+                    self._net_last_event_at[sid] = started_at
+                    self._net_capture_started_at[sid] = started_at
                     self._net_follow_tabs[tid] = {
                         "sessionId": sid,
                         "url": item.get("url", ""),
@@ -678,6 +965,7 @@ class PageManager:
         with self._net_lock:
             if not self._net_capture_active.get(session_id):
                 return
+            self._net_last_event_at[session_id] = time.time()
 
             if event_method == "Network.requestWillBeSent":
                 req = params.get("request", {})
@@ -817,44 +1105,282 @@ class PageManager:
     # Target 解析
     # =================================================================
 
+    _LIVE_PROBE_TIMEOUT = 0.5
+    _MUTATING_TARGET_ACTIONS = {
+        "click", "click_text", "fill", "select", "check", "hover", "press", "scroll", "drag",
+        "editor_set", "editor_type", "eval_js", "close_tab",
+    }
+
+    def _page_call_with_timeout(
+        self,
+        target_id: str,
+        method: str,
+        params: dict | None = None,
+        timeout_sec: float | None = None,
+    ) -> dict:
+        """在指定 page session 上执行 CDP 命令，允许覆盖较短超时。"""
+        sid = self._get_or_attach(target_id)
+        timeout_val = timeout_sec or self._PAGE_CALL_TIMEOUT
+        with self._cdp._lock:
+            if not self._cdp._ws:
+                raise RuntimeError("not connected")
+            self._cdp._msg_id += 1
+            mid = self._cdp._msg_id
+            payload: dict[str, Any] = {
+                "id": mid,
+                "method": method,
+                "sessionId": sid,
+            }
+            if params:
+                payload["params"] = params
+            self._cdp._inflight_requests += 1
+            old_timeout = self._cdp._ws.gettimeout()
+            self._cdp._ws.settimeout(timeout_val)
+            try:
+                self._cdp._ws.send(json.dumps(payload))
+                deadline = time.time() + timeout_val
+                while True:
+                    if time.time() > deadline:
+                        self._invalidate_session(target_id)
+                        raise RuntimeError(
+                            f"page_call timeout ({timeout_val}s): target {target_id[:8]} 可能无响应"
+                        )
+                    raw = self._cdp._ws.recv()
+                    msg = json.loads(raw if isinstance(raw, str) else raw.decode())
+                    if "method" in msg and "id" not in msg:
+                        evt = msg.get("method", "")
+                        if evt.startswith("Target."):
+                            self._cdp._handle_target_event(evt, msg.get("params", {}))
+                        elif evt.startswith("Network."):
+                            evt_sid = msg.get("sessionId", "")
+                            self._handle_network_event(evt, msg.get("params", {}), evt_sid)
+                        continue
+                    if msg.get("id") == mid:
+                        if "error" in msg:
+                            err = msg["error"]
+                            if "session" in str(err).lower():
+                                self._invalidate_session(target_id)
+                            raise RuntimeError(f"CDP page {method}: {err}")
+                        self._cdp._last_ok_at = time.time()
+                        self._cdp._last_error = ""
+                        return msg.get("result", {})
+            finally:
+                self._cdp._inflight_requests = max(0, self._cdp._inflight_requests - 1)
+                try:
+                    self._cdp._ws.settimeout(old_timeout)
+                except Exception:
+                    pass
+
+    def _probe_live_page(self, page: dict) -> dict | None:
+        """实时探测单个页面的焦点/可见性状态。"""
+        target_id = page.get("targetId", "")
+        if not target_id:
+            return None
+        try:
+            result = self._page_call_with_timeout(target_id, "Runtime.evaluate", {
+                "expression": JS_LIVE_PAGE_PROBE,
+                "returnByValue": True,
+                "awaitPromise": False,
+            }, timeout_sec=self._LIVE_PROBE_TIMEOUT)
+            raw = result.get("result", {}).get("value", "")
+            data = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(data, dict):
+                return None
+            return {
+                "targetId": target_id,
+                "url": data.get("url") or page.get("url", ""),
+                "title": data.get("title") or page.get("title", ""),
+                "hasFocus": bool(data.get("hasFocus")),
+                "visibilityState": str(data.get("visibilityState", "")),
+                "hidden": bool(data.get("hidden")),
+            }
+        except Exception:
+            return None
+
+    def detect_active_page(self) -> dict:
+        """通过实时焦点探测识别当前活动页；不依赖历史缓存。"""
+        try:
+            with self._cdp._lock:
+                self._cdp._rebuild_pages_cache_locked()
+        except Exception:
+            pass
+
+        pages = self._cdp.get_pages()
+        live_pages: list[dict] = []
+        visible_pages: list[dict] = []
+        for page in pages:
+            item = self._probe_live_page(page)
+            if not item:
+                continue
+            live_pages.append(item)
+            if item.get("hasFocus"):
+                return {"ok": True, "page": item, "source": "live_focus"}
+            if item.get("visibilityState") == "visible" and not item.get("hidden", False):
+                visible_pages.append(item)
+
+        if not live_pages:
+            return {"ok": False, "error": "active_page not found by live probe", "source": "live_probe"}
+
+        if len(visible_pages) == 1:
+            return {"ok": True, "page": visible_pages[0], "source": "live_visible"}
+        if len(visible_pages) > 1:
+            return {
+                "ok": False,
+                "error": "active_page ambiguous: multiple visible pages",
+                "source": "live_visible",
+                "candidates": visible_pages,
+            }
+
+        return {
+            "ok": False,
+            "error": "active_page not found by live probe",
+            "source": "live_probe",
+            "candidates": live_pages[:10],
+        }
+
+    @staticmethod
+    def _target_candidate_brief(page: dict) -> dict:
+        """压缩 target 信息，供 CLI 错误提示和 JSON 输出使用。"""
+        return {
+            "targetId": page.get("targetId", ""),
+            "title": page.get("title", ""),
+            "url": page.get("url", ""),
+            "type": page.get("type", ""),
+        }
+
+    @staticmethod
+    def _target_summary(pages: list[dict]) -> str:
+        """生成一行候选摘要，避免 target 解析失败时只给模糊错误。"""
+        return ", ".join(
+            f"{p.get('targetId', '')[:8]} {p.get('url', '')}" for p in pages[:8]
+        )
+
+    def _matching_pages_for_selector(self, selector: str) -> list[dict]:
+        """按通用 selector 返回所有候选页面。"""
+        pages = self._cdp.get_pages()
+        if selector.startswith("host:"):
+            expected = selector[5:].strip().lower()
+            result = []
+            for page in pages:
+                host = (urllib.parse.urlparse(str(page.get("url", ""))).hostname or "").lower()
+                if host == expected:
+                    result.append(page)
+            return result
+        if selector.startswith("title:"):
+            keyword = selector[6:].strip().lower()
+            return [p for p in pages if keyword and keyword in str(p.get("title", "")).lower()]
+        if selector.startswith("url-strict:"):
+            keywords = [k.strip().lower() for k in selector[11:].split(",") if k.strip()]
+            return [
+                p for p in pages
+                if keywords and all(kw in str(p.get("url", "")).lower() for kw in keywords)
+            ]
+        if selector.startswith("url:"):
+            keywords = [k.strip().lower() for k in selector[4:].split(",") if k.strip()]
+            return [
+                p for p in pages
+                if keywords and all(kw in str(p.get("url", "")).lower() for kw in keywords)
+            ]
+        if selector and len(selector) < 32:
+            return [
+                p for p in pages
+                if str(p.get("targetId", "")).upper().startswith(selector.upper())
+            ]
+        return []
+
+    def _resolve_unique_selector(self, selector: str, candidates: list[dict]) -> str:
+        """严格 selector 必须唯一命中，否则要求用户绑定 alias 或指定 targetId。"""
+        if not candidates:
+            raise RuntimeError(f"no page matching {selector}")
+        if len(candidates) > 1:
+            summary = self._target_summary(candidates)
+            raise RuntimeError(
+                f"multiple pages matching {selector}; candidates: {summary}; "
+                "use: tab bind <name> --target <targetId>"
+            )
+        return str(candidates[0].get("targetId", ""))
+
+    def resolve_target_info(self, target: str = "active") -> dict:
+        """解析 target 并返回结构化页面信息，供 target resolve CLI 使用。"""
+        try:
+            target_id = self.resolve_target(target)
+            pages = self._cdp.get_pages()
+            page = next((p for p in pages if p.get("targetId") == target_id), {"targetId": target_id})
+            return {"ok": True, **self._target_candidate_brief(page)}
+        except Exception as exc:
+            candidates = [self._target_candidate_brief(p) for p in self._matching_pages_for_selector(target)]
+            result: dict[str, Any] = {"ok": False, "error": str(exc)}
+            if candidates:
+                result["candidates"] = candidates
+                result["suggestion"] = "tab bind <name> --target <targetId>"
+            return result
+
     def resolve_target(self, target: str = "active") -> str:
         """解析 target 标识为 targetId。
 
         支持：
-          - "active"       当前活动 tab（macOS CGWindowList，其他平台取最后一个 page）
-          - "url:keyword"  URL 包含 keyword 的第一个 page
+          - "active"       macOS 上优先用前台 Chrome 窗口识别当前 tab，
+                           再回退 Target.targetActivated 缓存，最后回退最后一个 page
+          - "tab:name"     已绑定的标签页别名
+          - "url:keyword"  URL 包含 keyword 的第一个 page（支持多关键词用逗号分隔）
+          - "url-strict:keyword" URL 唯一命中才返回，否则列出候选
+          - "host:hostname" URL host 唯一命中才返回，否则列出候选
+          - "title:keyword" title 唯一命中才返回，否则列出候选
           - targetId       完整或前缀匹配
         """
+        if target.startswith("tab:"):
+            return self._get_bound_target(target[4:])
+
         if not target or target == "active":
-            if sys.platform == "darwin":
-                from cdp_actions import _applescript_active_tab
-                active_info = _applescript_active_tab()
-                if active_info:
-                    pages = self._cdp.get_pages()
-                    from daemon import _match_active_page
-                    matched = _match_active_page(active_info, pages)
-                    if matched:
-                        return matched["targetId"]
-            # fallback: 最后一个 page
-            pages = self._cdp.get_pages()
-            if pages:
-                return pages[-1]["targetId"]
-            raise RuntimeError("no active page found")
+            result = self.detect_active_page()
+            if result.get("ok"):
+                return result.get("page", {}).get("targetId", "")
+            candidates = result.get("candidates", [])
+            if candidates:
+                summary = ", ".join(
+                    f"{p.get('targetId','')[:8]} {p.get('url','')}" for p in candidates[:5]
+                )
+                raise RuntimeError(f"{result.get('error', 'no active page found')}；候选: {summary}")
+            raise RuntimeError(result.get("error", "no active page found"))
 
         if target.startswith("url:"):
-            keyword = target[4:].strip().lower()
-            for p in self._cdp.get_pages():
-                if keyword in p.get("url", "").lower():
-                    return p["targetId"]
-            raise RuntimeError(f"no page matching url:{keyword}")
+            # 支持多关键词（逗号分隔），所有词都命中才算匹配
+            for p in self._matching_pages_for_selector(target):
+                return p["targetId"]
+            keywords = [k.strip().lower() for k in target[4:].split(",") if k.strip()]
+            raise RuntimeError(f"no page matching url:{','.join(keywords)}")
+
+        if target.startswith(("host:", "title:", "url-strict:")):
+            return self._resolve_unique_selector(target, self._matching_pages_for_selector(target))
 
         # targetId（支持短前缀）
         if len(target) < 32:
-            for p in self._cdp.get_pages():
-                if p.get("targetId", "").upper().startswith(target.upper()):
-                    return p["targetId"]
+            candidates = self._matching_pages_for_selector(target)
+            if len(candidates) == 1:
+                return candidates[0]["targetId"]
+            if len(candidates) > 1:
+                summary = self._target_summary(candidates)
+                raise RuntimeError(
+                    f"multiple pages matching targetId prefix: {target}; candidates: {summary}; "
+                    "use: tab bind <name> --target <targetId>"
+                )
             raise RuntimeError(f"no page matching targetId prefix: {target}")
         return target
+
+    def get_cookies_for_url(self, url: str, target: str = "active") -> dict:
+        """在页面 session 中按 URL 获取 cookie，避免读取全域 cookie。"""
+        target_url = str(url or "").strip()
+        parsed = urllib.parse.urlparse(target_url)
+        if not parsed.scheme or not parsed.hostname:
+            return {"ok": False, "error": f"invalid url: {url}"}
+        target_id = self.resolve_target(target)
+        result = self.page_call(target_id, "Network.getCookies", {"urls": [target_url]})
+        return {
+            "ok": True,
+            "url": target_url,
+            "target_id": target_id,
+            "cookies": result.get("cookies", []),
+        }
 
     # =================================================================
     # 元素引用管理（@e1, @e2, ...）
@@ -907,6 +1433,89 @@ class PageManager:
                 return dict(info)  # 返回副本
         return {"selector": ref_or_selector}
 
+    def _refine_selector(self, target_id: str, selector: str) -> str:
+        """将 selector 解析到当前页面中最合适的可见节点，规避隐藏实例和重复 id。"""
+        expr = f"""
+        (function(selector) {{
+            function isVisible(el) {{
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 &&
+                    style.display !== 'none' && style.visibility !== 'hidden' &&
+                    parseFloat(style.opacity || '1') !== 0;
+            }}
+            function buildSelector(el) {{
+                if (el.id) {{
+                    const idSel = '#' + CSS.escape(el.id);
+                    if (document.querySelectorAll(idSel).length === 1) return idSel;
+                }}
+                const parts = [];
+                let cur = el;
+                for (let i = 0; i < 8 && cur && cur !== document.body; i++) {{
+                    let part = cur.tagName.toLowerCase();
+                    const name = cur.getAttribute && cur.getAttribute('name');
+                    if (name) {{
+                        const nameSel = part + '[name=' + JSON.stringify(name) + ']';
+                        if (document.querySelectorAll(nameSel).length === 1) {{
+                            parts.unshift(nameSel);
+                            return parts.join(' > ');
+                        }}
+                    }}
+                    const role = cur.getAttribute && cur.getAttribute('role');
+                    if (role) {{
+                        const roleSel = part + '[role=' + JSON.stringify(role) + ']';
+                        if (document.querySelectorAll(roleSel).length === 1) {{
+                            parts.unshift(roleSel);
+                            return parts.join(' > ');
+                        }}
+                    }}
+                    const siblings = cur.parentElement
+                        ? Array.from(cur.parentElement.children).filter(c => c.tagName === cur.tagName)
+                        : [];
+                    if (siblings.length > 1) {{
+                        part += ':nth-of-type(' + (siblings.indexOf(cur) + 1) + ')';
+                    }}
+                    parts.unshift(part);
+                    cur = cur.parentElement;
+                }}
+                return parts.join(' > ');
+            }}
+
+            let matches = [];
+            try {{
+                matches = Array.from(document.querySelectorAll(selector));
+            }} catch (e) {{
+                return JSON.stringify({{ok: false, error: 'invalid selector'}});
+            }}
+            if (!matches.length) return JSON.stringify({{ok: false, error: 'not found'}});
+
+            const visible = matches.filter(isVisible);
+            const visibleInDialog = visible.filter(el => el.closest('.ant-modal-root, .ant-modal-wrap, .ant-modal, [role="dialog"]'));
+            const pool = visibleInDialog.length ? visibleInDialog : (visible.length ? visible : matches);
+            pool.sort((a, b) => {{
+                const ra = a.getBoundingClientRect();
+                const rb = b.getBoundingClientRect();
+                return (rb.width * rb.height) - (ra.width * ra.height);
+            }});
+            const picked = pool[0];
+            return JSON.stringify({{
+                ok: true,
+                selector: buildSelector(picked),
+                matchedCount: matches.length,
+                visibleCount: visible.length,
+                visibleDialogCount: visibleInDialog.length,
+            }});
+        }})({json.dumps(selector)})
+        """
+        try:
+            data = self._evaluate_json(target_id, expr)
+        except Exception:
+            return selector
+        if data.get("ok") and data.get("selector"):
+            return str(data["selector"])
+        return selector
+
     # =================================================================
     # 页面 JS 执行
     # =================================================================
@@ -945,8 +1554,19 @@ class PageManager:
         target: str = "active",
         scope: str | None = None,
         include_cursor: bool = False,
+        compact: bool = False,
+        depth: int | None = None,
+        include_urls: bool = False,
     ) -> dict:
-        """获取页面可交互元素快照，返回带 @eN 引用的元素列表。"""
+        """获取页面可交互元素快照，返回带 @eN 引用的元素列表。
+
+        大 DOM 保护策略（按优先级）：
+        1. 用户指定了 scope → 直接用
+        2. DOM 未超限 → 全页扫描
+        3. DOM 超限但 scope 候选**覆盖整个视口** → 用最佳候选
+        4. DOM 超限且无合适候选 → 不裁剪 scope，让 JS_SNAPSHOT 内部的
+           "仅取可见元素"过滤来限流（避免把右侧面板整体漏掉）
+        """
         target_id = self.resolve_target(target)
 
         # ---- 大 DOM 保护：预检元素数量 ----
@@ -954,18 +1574,37 @@ class PageManager:
             try:
                 count = self._evaluate(target_id, "document.querySelectorAll('*').length")
                 if isinstance(count, (int, float)) and count > self._SNAPSHOT_MAX_ELEMENTS:
-                    # 尝试自动限定到主内容区
+                    # 找一个覆盖最多视口面积的单容器（而不是取第一个元素数够小的）
                     auto_scope = self._evaluate(target_id, r"""
                         (() => {
-                            const candidates = ['#app', '#root', 'main', '[role=main]', '.main-content', '.content'];
+                            const vw = window.innerWidth, vh = window.innerHeight;
+                            const vpArea = vw * vh;
+                            const candidates = [
+                                'body', '#app', '#root', 'main', '[role=main]',
+                                '.main-content', '.content', '.container',
+                                '[class*=layout]', '[class*=Layout]',
+                            ];
+                            let bestSel = '', bestScore = 0;
                             for (const s of candidates) {
                                 const el = document.querySelector(s);
-                                if (el && el.querySelectorAll('*').length < 5000) return s;
+                                if (!el) continue;
+                                const elCount = el.querySelectorAll('*').length;
+                                if (elCount > 8000) continue;  // 太大跳过
+                                const r = el.getBoundingClientRect();
+                                const visArea = Math.min(r.right, vw) * Math.min(r.bottom, vh)
+                                              - Math.max(r.left, 0) * Math.max(r.top, 0);
+                                const coverage = visArea / vpArea;
+                                // 覆盖率 > 80% 才考虑，取元素数最多（内容最丰富）的那个
+                                if (coverage > 0.8 && elCount > bestScore) {
+                                    bestScore = elCount;
+                                    bestSel = s;
+                                }
                             }
-                            return '';
+                            return bestSel;
                         })()
                     """)
-                    if auto_scope:
+                    # 只有候选覆盖率足够高才采用，否则保持全页（让 JS_SNAPSHOT 内部过滤）
+                    if auto_scope and auto_scope != "body":
                         scope = auto_scope
             except Exception:
                 pass
@@ -976,10 +1615,34 @@ class PageManager:
         data = self._evaluate_json(target_id, expr)
         if "error" in data:
             raise RuntimeError(data["error"])
-        elements = self._store_refs(data.get("elements", []), target_id)
+        raw_elements = data.get("elements", [])
+        if isinstance(depth, int) and depth >= 0:
+            raw_elements = [
+                el for el in raw_elements
+                if not isinstance(el, dict) or int(el.get("depth", 0) or 0) <= depth
+            ]
+        elements = self._store_refs(raw_elements, target_id)
+        if compact:
+            compact_keys = {"ref", "desc", "value", "checked", "depth"}
+            if include_urls:
+                compact_keys.add("href")
+            elements = [
+                {k: v for k, v in el.items() if k in compact_keys and v not in ("", None, False)}
+                for el in elements
+            ]
         result: dict[str, Any] = {"elements": elements, "target_id": target_id, "count": len(elements)}
         if scope:
             result["scope"] = scope
+        if compact:
+            result["compact"] = True
+        if depth is not None:
+            result["depth"] = depth
+        if include_urls:
+            result["include_urls"] = True
+        try:
+            result["url"] = self._evaluate(target_id, "location.href") or ""
+        except Exception:
+            pass
         return result
 
     def _get_element_center(self, target_id: str, selector: str) -> dict:
@@ -1015,6 +1678,35 @@ class PageManager:
             {"type": "mouseReleased", "x": x, "y": y,
              "button": button, "clickCount": click_count})
 
+    def _js_click(self, target_id: str, selector: str) -> bool:
+        """通过 JS el.click() 触发点击，穿透 Angular Zone / Vue 响应式。
+        返回 True 表示找到元素并 click()，False 表示未找到。
+        """
+        result = self._evaluate(target_id, f"""
+            (() => {{
+                var el = document.querySelector({json.dumps(selector)});
+                if (!el) return false;
+                el.click();
+                return true;
+            }})()
+        """)
+        return bool(result)
+
+    @staticmethod
+    def _is_framework_element(attrs: dict) -> bool:
+        """检测元素是否由 Angular / Vue / Svelte 等框架渲染。
+        这些框架的 click 事件绑定在 Zone/响应式系统上，纯 CDP 鼠标事件无法触发。
+        """
+        cls = attrs.get("className", "") or ""
+        outer = attrs.get("outerHTML", "") or ""
+        # Angular: _ngcontent-xxx、ng-star-inserted、[role=tab] 在 nz-tabs 里
+        if "_ngcontent" in outer or "ng-star-inserted" in cls:
+            return True
+        # Vue: __vue__ 属性或 v- 指令
+        if "__vue__" in outer or " v-" in outer:
+            return True
+        return False
+
     def click(
         self,
         ref_or_selector: str,
@@ -1022,9 +1714,13 @@ class PageManager:
         dblclick: bool = False,
         right: bool = False,
         at: tuple[int, int] | None = None,
+        force_js: bool = False,
     ) -> dict:
-        """点击元素。全部使用 CDP 原生鼠标事件，可靠触发 Vue/React/Ant Design。
+        """点击元素。CDP 原生鼠标事件 + Angular/Vue Zone 自动兼容。
 
+        自动检测 Angular/Vue 渲染的元素，先发 CDP 鼠标事件，再追加
+        JS el.click() 确保 Zone 事件触发。
+        :param force_js: True 时强制只走 JS click（跳过 CDP 鼠标事件）
         :param dblclick: True 时双击（clickCount=2）
         :param right: True 时右键点击（触发右键菜单）
         :param at: 指定坐标点击，忽略 ref_or_selector
@@ -1032,30 +1728,29 @@ class PageManager:
         target_id = self.resolve_target(target)
         btn = "right" if right else "left"
 
-        # --at 坐标点击
+        # --at 坐标点击（仅 CDP，不含 JS click）
         if at:
             x, y = at
-            self._cdp_mouse_click(target_id, x, y, button=btn)
-            if dblclick and not right:
-                self._cdp_mouse_click(target_id, x, y, click_count=2)
+            if not force_js:
+                self._cdp_mouse_click(target_id, x, y, button=btn)
+                if dblclick and not right:
+                    self._cdp_mouse_click(target_id, x, y, click_count=2)
             return {"ok": True, "at": [x, y], "dblclick": dblclick, "right": right}
 
         ref_info = self.resolve_ref(ref_or_selector)
         target_id = ref_info.get("target_id") or target_id
-        selector = ref_info["selector"]
+        selector = self._refine_selector(target_id, ref_info["selector"])
         if not selector:
             raise RuntimeError(f"引用 {ref_or_selector} 无可用选择器")
 
-        # 获取元素中心坐标
+        # 获取元素中心坐标 + 框架检测属性
         try:
             rect = self._get_element_center(target_id, selector)
         except RuntimeError:
-            # 兜底：用 text/href/tag 查找
             fallback_text = ref_info.get("text", "")
             fallback_href = ref_info.get("href", "")
             fallback_tag = ref_info.get("tag", "")
             if fallback_text or fallback_href:
-                # 用 JS 兜底定位并获取坐标
                 fb_data = self._evaluate(target_id, f"""
                     (function() {{
                         var tag = {json.dumps(fallback_tag or '*')};
@@ -1090,13 +1785,51 @@ class PageManager:
 
         x, y = rect["x"], rect["y"]
 
-        # CDP 原生鼠标事件
-        self._cdp_mouse_click(target_id, x, y, button=btn)
-        if dblclick and not right:
-            self._cdp_mouse_click(target_id, x, y, click_count=2)
+        # 检测是否为 Angular/Vue 框架元素
+        framework_el = self._evaluate(target_id, f"""
+            (() => {{
+                var el = document.querySelector({json.dumps(selector)});
+                if (!el) return false;
+                var html = el.outerHTML.slice(0, 300);
+                var cls = el.className || '';
+                var attrs = el.getAttributeNames ? el.getAttributeNames() : [];
+                // Angular: _ngcontent-xxx、ng-star-inserted、CDK 属性
+                if (html.includes('_ngcontent') || cls.includes('ng-star')) return true;
+                // Angular CDK 特征属性（nztabnavitem、cdkmonitor、cdk开头）
+                if (attrs.some(a => a.startsWith('nz') || a.startsWith('cdk') || a === '_nghost' || a.startsWith('_ng'))) return true;
+                // Vue
+                if (typeof el.__vue__ !== 'undefined' || typeof el.__vueParentComponent !== 'undefined') return true;
+                // Angular Zone click listener（__zone_symbol__clickfalse）
+                if (el.__zone_symbol__clickfalse && el.__zone_symbol__clickfalse.length) return true;
+                return false;
+            }})()
+        """)
+        is_framework = bool(framework_el)
 
-        return {"ok": True, "tag": rect.get("tag", ""),
-                "dblclick": dblclick, "right": right, "at": [x, y]}
+        js_click_done = False
+        if force_js or (is_framework and not right):
+            # 框架元素：JS click() 优先（穿透 Zone），再叠加 CDP 鼠标（触发 ripple 等视觉反馈）
+            js_click_done = self._js_click(target_id, selector)
+
+        if not force_js:
+            self._cdp_mouse_click(target_id, x, y, button=btn)
+            if dblclick and not right:
+                self._cdp_mouse_click(target_id, x, y, click_count=2)
+
+        # 框架元素且 CDP 鼠标后仍需保证 Zone 触发（double-fire 幂等）
+        if is_framework and not js_click_done and not right:
+            self._js_click(target_id, selector)
+            js_click_done = True
+
+        return {
+            "ok": True,
+            "tag": rect.get("tag", ""),
+            "dblclick": dblclick,
+            "right": right,
+            "at": [x, y],
+            "js_click": js_click_done,
+            "framework": is_framework,
+        }
 
     def fill(
         self,
@@ -1115,7 +1848,7 @@ class PageManager:
         """
         ref_info = self.resolve_ref(ref_or_selector)
         target_id = ref_info.get("target_id") or self.resolve_target(target)
-        selector = ref_info["selector"]
+        selector = self._refine_selector(target_id, ref_info["selector"])
         if not selector:
             raise RuntimeError(f"引用 {ref_or_selector} 无可用选择器")
 
@@ -1177,6 +1910,7 @@ class PageManager:
         ref_or_selector: str,
         value: str,
         by_label: bool = False,
+        search_text: str | None = None,
         target: str = "active",
     ) -> dict:
         """选择下拉框选项。
@@ -1185,7 +1919,7 @@ class PageManager:
         """
         ref_info = self.resolve_ref(ref_or_selector)
         target_id = ref_info.get("target_id") or self.resolve_target(target)
-        selector = ref_info["selector"]
+        selector = self._refine_selector(target_id, ref_info["selector"])
         if not selector:
             raise RuntimeError(f"引用 {ref_or_selector} 无可用选择器")
 
@@ -1198,7 +1932,7 @@ class PageManager:
 
         # 2. 不是原生 select → 走自定义下拉框路径（awaitPromise）
         if data.get("error") == "not_native_select" or "not a <select>" in str(data.get("error", "")):
-            expr2 = f'({JS_CUSTOM_SELECT})({json.dumps(selector)}, {json.dumps(value)})'
+            expr2 = f'({JS_CUSTOM_SELECT})({json.dumps(selector)}, {json.dumps(value)}, {json.dumps(search_text)})'
             result = self.page_call(target_id, "Runtime.evaluate", {
                 "expression": expr2,
                 "returnByValue": True,
@@ -1222,7 +1956,7 @@ class PageManager:
         """勾选/取消勾选 checkbox 或 radio。"""
         ref_info = self.resolve_ref(ref_or_selector)
         target_id = ref_info.get("target_id") or self.resolve_target(target)
-        selector = ref_info["selector"]
+        selector = self._refine_selector(target_id, ref_info["selector"])
         if not selector:
             raise RuntimeError(f"引用 {ref_or_selector} 无可用选择器")
         state_arg = json.dumps(checked) if checked is not None else "null"
@@ -1263,7 +1997,7 @@ class PageManager:
             x, y = at
         elif ref_or_selector:
             ref_info = self.resolve_ref(ref_or_selector)
-            sel = ref_info["selector"]
+            sel = self._refine_selector(target_id, ref_info["selector"])
             rect_data = self._evaluate(target_id, f"""
                 (function() {{
                     var el = document.querySelector({json.dumps(sel)});
@@ -1286,16 +2020,47 @@ class PageManager:
         })
         return {"ok": True, "at": [x, y]}
 
+    # 组合键修饰符名称 → CDP modifiers bitmask
+    _MODIFIER_MAP: dict[str, int] = {
+        "alt": 1, "option": 1,
+        "ctrl": 2, "control": 2,
+        "meta": 4, "cmd": 4, "command": 4, "win": 4,
+        "shift": 8,
+    }
+
+    @classmethod
+    def _parse_key_combo(cls, key_str: str) -> tuple[int, str]:
+        """解析组合键字符串，返回 (modifiers_bitmask, main_key)。
+
+        示例：
+          "Meta+S"       → (4,  "s")
+          "Ctrl+Shift+P" → (10, "p")
+          "Enter"        → (0,  "Enter")
+        """
+        parts = key_str.split("+")
+        modifiers = 0
+        main_key = parts[-1]
+        for mod in parts[:-1]:
+            modifiers |= cls._MODIFIER_MAP.get(mod.lower(), 0)
+        return modifiers, main_key
+
     def press(
         self,
         key: str,
         ref_or_selector: str | None = None,
         target: str = "active",
+        modifiers: int = 0,
     ) -> dict:
         """发送按键事件（使用 CDP Input.dispatchKeyEvent，兼容 Vue/React）。
 
-        模拟真实键盘的完整事件序列：rawKeyDown → char → keyUp
+        支持组合键语法，例如 "Meta+S"、"Ctrl+Shift+P"、"Alt+F4"。
+        模拟真实键盘的完整事件序列：rawKeyDown → char（若有文字） → keyUp
         """
+        # 解析组合键（优先级：字符串中的 "+" 语法 > modifiers 参数）
+        if "+" in key:
+            extra_mods, key = self._parse_key_combo(key)
+            modifiers |= extra_mods
+
         if ref_or_selector:
             ref_info = self.resolve_ref(ref_or_selector)
             target_id = ref_info.get("target_id") or self.resolve_target(target)
@@ -1324,14 +2089,20 @@ class PageManager:
             kc = ord(key.upper()) if len(key) == 1 else 0
             text = key if len(key) == 1 else ""
 
+        # 组合键按下修饰符时，普通字母不发送 char 事件（防止意外输入）
+        if modifiers and text and len(text) == 1:
+            text = ""
+
         # 真实键盘事件序列：rawKeyDown → char → keyUp
-        self.page_call(target_id, "Input.dispatchKeyEvent", {
+        base_params = {
             "type": "rawKeyDown",
             "key": k,
             "code": code,
             "windowsVirtualKeyCode": kc,
             "nativeVirtualKeyCode": kc,
-        })
+            "modifiers": modifiers,
+        }
+        self.page_call(target_id, "Input.dispatchKeyEvent", base_params)
         if text:
             self.page_call(target_id, "Input.dispatchKeyEvent", {
                 "type": "char",
@@ -1341,6 +2112,7 @@ class PageManager:
                 "unmodifiedText": text,
                 "windowsVirtualKeyCode": kc,
                 "nativeVirtualKeyCode": kc,
+                "modifiers": modifiers,
             })
         self.page_call(target_id, "Input.dispatchKeyEvent", {
             "type": "keyUp",
@@ -1348,8 +2120,14 @@ class PageManager:
             "code": code,
             "windowsVirtualKeyCode": kc,
             "nativeVirtualKeyCode": kc,
+            "modifiers": modifiers,
         })
-        return {"ok": True, "key": key}
+        orig_key = "+".join([m for m in ["Meta" if modifiers & 4 else "",
+                                          "Ctrl" if modifiers & 2 else "",
+                                          "Alt" if modifiers & 1 else "",
+                                          "Shift" if modifiers & 8 else ""]
+                              if m] + [key]) if modifiers else key
+        return {"ok": True, "key": orig_key, "modifiers": modifiers}
 
     def scroll(
         self,
@@ -1529,6 +2307,356 @@ class PageManager:
         target_id = self.resolve_target(target)
         return self._evaluate(target_id, "document.title") or ""
 
+    def screenshot(
+        self,
+        target: str = "active",
+        path: str = "",
+        annotate: bool = False,
+        full_page: bool = False,
+    ) -> dict:
+        """保存页面截图。
+
+        annotate=True 时先扫描交互元素，在页面上临时叠加编号标签。
+        标签编号与 @eN 引用一致，截图后可直接使用这些 ref 继续交互。
+        """
+        target_id = self.resolve_target(target)
+        if not path:
+            path = str(Path(tempfile.gettempdir()) / f"cdp_screenshot_{int(time.time() * 1000)}.png")
+        out_path = Path(path).expanduser()
+        if not out_path.is_absolute():
+            out_path = Path.cwd() / out_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        legend: list[dict[str, Any]] = []
+        overlay_id = "__cdp_daemon_annotate_overlay__"
+
+        def _remove_overlay() -> None:
+            try:
+                self._evaluate(target_id, f"""
+                    (() => {{
+                        const old = document.getElementById({json.dumps(overlay_id)});
+                        if (old) old.remove();
+                    }})()
+                """)
+            except Exception:
+                pass
+
+        try:
+            if annotate:
+                snap = self.snapshot(target=target_id, include_cursor=True)
+                elements = snap.get("elements", [])
+                labels = []
+                for idx, el in enumerate(elements, 1):
+                    rect = el.get("rect") or {}
+                    x = int(rect.get("x", 0) or 0)
+                    y = int(rect.get("y", 0) or 0)
+                    w = int(rect.get("w", 0) or 0)
+                    h = int(rect.get("h", 0) or 0)
+                    if w <= 0 and h <= 0:
+                        continue
+                    labels.append({"index": idx, "x": x, "y": y, "w": w, "h": h})
+                    legend.append({"index": idx, "ref": el.get("ref"), "desc": el.get("desc", "")})
+                self._evaluate(target_id, f"""
+                    (() => {{
+                        const old = document.getElementById({json.dumps(overlay_id)});
+                        if (old) old.remove();
+                        const root = document.createElement('div');
+                        root.id = {json.dumps(overlay_id)};
+                        root.style.cssText = 'position:fixed;left:0;top:0;z-index:2147483647;pointer-events:none;font-family:Arial,sans-serif;';
+                        const labels = {json.dumps(labels)};
+                        for (const item of labels) {{
+                            const box = document.createElement('div');
+                            box.textContent = '[' + item.index + ']';
+                            box.style.cssText = [
+                                'position:fixed',
+                                'left:' + Math.max(0, item.x) + 'px',
+                                'top:' + Math.max(0, item.y) + 'px',
+                                'background:#ff3b30',
+                                'color:#fff',
+                                'border:1px solid #fff',
+                                'border-radius:3px',
+                                'padding:1px 4px',
+                                'font-size:12px',
+                                'font-weight:bold',
+                                'line-height:16px',
+                                'box-shadow:0 1px 3px rgba(0,0,0,.45)'
+                            ].join(';');
+                            const outline = document.createElement('div');
+                            outline.style.cssText = [
+                                'position:fixed',
+                                'left:' + Math.max(0, item.x) + 'px',
+                                'top:' + Math.max(0, item.y) + 'px',
+                                'width:' + Math.max(1, item.w) + 'px',
+                                'height:' + Math.max(1, item.h) + 'px',
+                                'border:2px solid #ff3b30',
+                                'box-sizing:border-box',
+                                'border-radius:3px'
+                            ].join(';');
+                            root.appendChild(outline);
+                            root.appendChild(box);
+                        }}
+                        document.documentElement.appendChild(root);
+                    }})()
+                """)
+
+            params: dict[str, Any] = {"format": "png", "fromSurface": True}
+            if full_page:
+                metrics = self.page_call(target_id, "Page.getLayoutMetrics", {})
+                content = metrics.get("contentSize", {})
+                width = max(1, int(content.get("width", 0) or 0))
+                height = max(1, int(content.get("height", 0) or 0))
+                if width and height:
+                    params["captureBeyondViewport"] = True
+                    params["clip"] = {"x": 0, "y": 0, "width": width, "height": height, "scale": 1}
+            captured = self.page_call(target_id, "Page.captureScreenshot", params)
+            data = captured.get("data", "")
+            if not data:
+                raise RuntimeError("Page.captureScreenshot returned empty data")
+            out_path.write_bytes(base64.b64decode(data))
+            return {
+                "ok": True,
+                "path": str(out_path),
+                "target_id": target_id,
+                "annotate": annotate,
+                "legend": legend,
+            }
+        finally:
+            if annotate:
+                _remove_overlay()
+
+    @staticmethod
+    def _png_pixel_stats(data: bytes, max_samples: int = 50000) -> dict[str, Any]:
+        """解析 Chrome PNG 截图并采样统计非白像素比例。"""
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return {"ok": False, "error": "not a png"}
+
+        pos = 8
+        width = height = bit_depth = color_type = 0
+        idat = bytearray()
+        while pos + 8 <= len(data):
+            length = struct.unpack(">I", data[pos:pos + 4])[0]
+            ctype = data[pos + 4:pos + 8]
+            chunk = data[pos + 8:pos + 8 + length]
+            pos += 12 + length
+            if ctype == b"IHDR":
+                width, height, bit_depth, color_type, _, _, _ = struct.unpack(">IIBBBBB", chunk)
+            elif ctype == b"IDAT":
+                idat.extend(chunk)
+            elif ctype == b"IEND":
+                break
+
+        if bit_depth != 8 or color_type not in (2, 6) or width <= 0 or height <= 0:
+            return {"ok": False, "error": f"unsupported png: bit_depth={bit_depth} color_type={color_type}"}
+
+        channels = 4 if color_type == 6 else 3
+        stride = width * channels
+        raw = zlib.decompress(bytes(idat))
+        rows: list[bytearray] = []
+        offset = 0
+        prev = bytearray(stride)
+        for _ in range(height):
+            filter_type = raw[offset]
+            offset += 1
+            scan = bytearray(raw[offset:offset + stride])
+            offset += stride
+            for i in range(stride):
+                left = scan[i - channels] if i >= channels else 0
+                up = prev[i]
+                up_left = prev[i - channels] if i >= channels else 0
+                if filter_type == 1:
+                    scan[i] = (scan[i] + left) & 0xFF
+                elif filter_type == 2:
+                    scan[i] = (scan[i] + up) & 0xFF
+                elif filter_type == 3:
+                    scan[i] = (scan[i] + ((left + up) // 2)) & 0xFF
+                elif filter_type == 4:
+                    p = left + up - up_left
+                    pa, pb, pc = abs(p - left), abs(p - up), abs(p - up_left)
+                    pr = left if pa <= pb and pa <= pc else (up if pb <= pc else up_left)
+                    scan[i] = (scan[i] + pr) & 0xFF
+            rows.append(scan)
+            prev = scan
+
+        total_pixels = width * height
+        step = max(1, total_pixels // max_samples)
+        sampled = non_white = transparent = 0
+        colors: set[tuple[int, int, int]] = set()
+        brightness_sum = 0.0
+        idx = 0
+        for y, row in enumerate(rows):
+            for x in range(width):
+                if idx % step != 0:
+                    idx += 1
+                    continue
+                base = x * channels
+                r, g, b = row[base], row[base + 1], row[base + 2]
+                a = row[base + 3] if channels == 4 else 255
+                sampled += 1
+                if a == 0:
+                    transparent += 1
+                if a > 0 and not (r >= 248 and g >= 248 and b >= 248):
+                    non_white += 1
+                colors.add((r // 16, g // 16, b // 16))
+                brightness_sum += (r + g + b) / 3
+                idx += 1
+
+        return {
+            "ok": True,
+            "width": width,
+            "height": height,
+            "sampled": sampled,
+            "non_white_ratio": round(non_white / sampled, 6) if sampled else 0,
+            "transparent_ratio": round(transparent / sampled, 6) if sampled else 0,
+            "distinct_color_buckets": len(colors),
+            "avg_brightness": round(brightness_sum / sampled, 2) if sampled else 0,
+        }
+
+    def diagnose_page(
+        self,
+        target: str = "active",
+        path: str = "",
+        full_page: bool = False,
+        wait_ms: int = 0,
+    ) -> dict:
+        """诊断页面是否白屏、图表是否有可见 DOM，并保存截图。"""
+        target_id = self.resolve_target(target)
+        if wait_ms > 0:
+            time.sleep(max(0, wait_ms) / 1000)
+
+        dom = self._evaluate_json(target_id, r"""
+            (() => {
+              const visible = (el) => {
+                if (!el) return false;
+                const r = el.getBoundingClientRect();
+                const s = getComputedStyle(el);
+                return r.width > 0 && r.height > 0 && s.display !== 'none'
+                  && s.visibility !== 'hidden' && Number(s.opacity || 1) > 0;
+              };
+              const rect = (el) => {
+                const r = el.getBoundingClientRect();
+                return {x: Math.round(r.x), y: Math.round(r.y), w: Math.round(r.width), h: Math.round(r.height)};
+              };
+              const chartSelectors = [
+                'canvas', 'svg',
+                '[class*="echart"]', '[class*="antv"]', '[class*="chart"]',
+                '[class*="g2"]', '[class*="s2"]', '.wrapper-outer'
+              ];
+              const chartNodes = Array.from(document.querySelectorAll(chartSelectors.join(',')))
+                .filter(visible)
+                .slice(0, 80)
+                .map(el => ({
+                  tag: el.tagName,
+                  className: String(el.className || '').slice(0, 120),
+                  text: (el.innerText || el.textContent || '').trim().slice(0, 120),
+                  rect: rect(el)
+                }));
+              const normalizeText = (text) => String(text || '').replace(/\s+/g, ' ').trim();
+              const textBlocks = Array.from(document.querySelectorAll('h1,h2,h3,h4,h5,h6,p,span,div,label,td,th,button,a,[role="heading"],[role="status"],[role="alert"]'))
+                .filter(visible)
+                .map(el => ({el, text: normalizeText(el.innerText || el.textContent), box: rect(el)}))
+                .filter(item => item.text && item.text.length <= 180 && item.box.w > 0 && item.box.h > 0 && item.box.h <= 220 && item.box.w <= innerWidth * 0.98)
+                .slice(0, 120)
+                .map(item => ({
+                  tag: item.el.tagName,
+                  role: item.el.getAttribute('role') || '',
+                  className: String(item.el.className || '').slice(0, 100),
+                  text: item.text.slice(0, 180),
+                  rect: item.box
+                }));
+              const numericTextBlocks = textBlocks
+                .filter(item => /[-+]?\d[\d,]*(\.\d+)?%?/.test(item.text))
+                .slice(0, 80);
+              const emptySelectors = [
+                '[role="table"]', '[role="grid"]', '[role="list"]', '[role="tabpanel"]',
+                '[class*="card"]', '[class*="panel"]', '[class*="content"]',
+                '[class*="chart"]', '[class*="table"]', '[data-testid]'
+              ];
+              const emptyContentCandidates = Array.from(document.querySelectorAll(emptySelectors.join(',')))
+                .filter(visible)
+                .map(el => ({el, text: normalizeText(el.innerText || el.textContent), box: rect(el)}))
+                .filter(item => item.box.w >= 80 && item.box.h >= 40 && !item.text
+                  && !item.el.querySelector('canvas,svg,img,video,input,textarea,select'))
+                .slice(0, 80)
+                .map(item => ({
+                  tag: item.el.tagName,
+                  role: item.el.getAttribute('role') || '',
+                  ariaLabel: item.el.getAttribute('aria-label') || '',
+                  title: item.el.getAttribute('title') || '',
+                  testId: item.el.getAttribute('data-testid') || '',
+                  className: String(item.el.className || '').slice(0, 120),
+                  rect: item.box
+                }));
+              const text = document.body ? (document.body.innerText || '') : '';
+              const resources = performance.getEntriesByType('resource')
+                .filter(e => e.initiatorType === 'script' || e.initiatorType === 'img' || e.initiatorType === 'fetch' || e.initiatorType === 'xmlhttprequest')
+                .slice(-80)
+                .map(e => ({name: e.name, type: e.initiatorType, duration: Math.round(e.duration || 0), transferSize: e.transferSize || 0}));
+              return JSON.stringify({
+                url: location.href,
+                title: document.title,
+                readyState: document.readyState,
+                bodyTextLength: text.length,
+                bodyTextSample: text.slice(0, 500),
+                viewport: {w: innerWidth, h: innerHeight, dpr: devicePixelRatio},
+                scroll: {x: scrollX, y: scrollY, w: document.documentElement.scrollWidth, h: document.documentElement.scrollHeight},
+                visibleCanvas: Array.from(document.querySelectorAll('canvas')).filter(visible).length,
+                visibleSvg: Array.from(document.querySelectorAll('svg')).filter(visible).length,
+                chartCandidates: chartNodes,
+                textBlocks,
+                numericTextBlocks,
+                emptyContentCandidates,
+                resourceTail: resources
+              });
+            })()
+        """)
+
+        if not path:
+            path = str(Path(tempfile.gettempdir()) / f"cdp_diagnose_{int(time.time() * 1000)}.png")
+        out_path = Path(path).expanduser()
+        if not out_path.is_absolute():
+            out_path = Path.cwd() / out_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+
+        params: dict[str, Any] = {"format": "png", "fromSurface": True}
+        if full_page:
+            metrics = self.page_call(target_id, "Page.getLayoutMetrics", {})
+            content = metrics.get("contentSize", {})
+            width = max(1, int(content.get("width", 0) or 0))
+            height = max(1, int(content.get("height", 0) or 0))
+            params["captureBeyondViewport"] = True
+            params["clip"] = {"x": 0, "y": 0, "width": width, "height": height, "scale": 1}
+        captured = self.page_call(target_id, "Page.captureScreenshot", params)
+        png_bytes = base64.b64decode(captured.get("data", ""))
+        out_path.write_bytes(png_bytes)
+        pixel_stats = self._png_pixel_stats(png_bytes)
+
+        conclusions: list[str] = []
+        non_white = pixel_stats.get("non_white_ratio", 0) if pixel_stats.get("ok") else 0
+        if non_white < 0.01:
+            conclusions.append("截图几乎全白，疑似白屏或截图模式异常")
+        if dom.get("bodyTextLength", 0) > 0 and non_white < 0.01:
+            conclusions.append("DOM 有文本但截图白，优先检查 full-page 截图模式或遮罩层")
+        if not dom.get("chartCandidates"):
+            conclusions.append("未发现可见图表候选 DOM")
+        elif dom.get("visibleCanvas", 0) + dom.get("visibleSvg", 0) == 0:
+            conclusions.append("发现图表容器但没有可见 canvas/svg，可能仍在加载或图表渲染失败")
+        else:
+            conclusions.append("发现可见图表 DOM，截图像素可用于二次确认")
+        if dom.get("emptyContentCandidates"):
+            conclusions.append(f"发现 {len(dom.get('emptyContentCandidates') or [])} 个可见但内容为空的通用容器候选")
+        if dom.get("bodyTextLength", 0) > 0 and not dom.get("textBlocks"):
+            conclusions.append("页面有 body 文本但未提取到稳定可见文本块，可能存在遮罩、虚拟滚动或文本在 Shadow DOM 中")
+
+        return {
+            "ok": True,
+            "target_id": target_id,
+            "screenshot": str(out_path),
+            "full_page": full_page,
+            "dom": dom,
+            "pixel_stats": pixel_stats,
+            "conclusions": conclusions,
+        }
+
     def activate(self, target: str = "active") -> dict:
         """将指定 tab 切换到前台（Target.activateTarget）。"""
         target_id = self.resolve_target(target)
@@ -1536,18 +2664,23 @@ class PageManager:
         title = self._evaluate(target_id, "document.title") or ""
         return {"ok": True, "targetId": target_id, "title": title}
 
-    def open_tab(self, url: str, wait_ms: int = 3000, activate: bool = True, group: str = "") -> dict:
+    def open_tab(
+        self,
+        url: str,
+        wait_ms: int = 3000,
+        activate: bool = True,
+        group: str = "",
+        alias: str = "",
+        requested_group: str = "",
+    ) -> dict:
         """打开新标签页并等待加载。
 
         :param url: 要打开的 URL
         :param wait_ms: 等待页面加载的毫秒数
         :param activate: 是否切换到新 tab（默认 True）
-        :param group: 立即加入指定群组（群组不存在则报错）
+        :param group: 保留兼容参数；CDP 新开页必须进入固定自动化分组
+        :param requested_group: 用户传入但被忽略的自定义分组名
         """
-        # 预检查：群组存在性
-        if group and group not in self._tab_groups:
-            raise RuntimeError(f"群组 '{group}' 不存在，请先 group create")
-
         result = self._cdp.call("Target.createTarget", {"url": url})
         target_id = result.get("targetId", "")
         if not target_id:
@@ -1562,15 +2695,11 @@ class PageManager:
             _time.sleep(0.3)
             try:
                 title = self._evaluate(target_id, "document.title") or ""
-                url_final = self._evaluate(target_id, "location.href") or url
-                if title:
+                current_url = self._evaluate(target_id, "location.href") or ""
+                if current_url and (current_url != "about:blank" or url == "about:blank"):
+                    url_final = current_url
+                if title or (current_url and current_url != "about:blank"):
                     break
-            except Exception:
-                pass
-
-        if activate:
-            try:
-                self._cdp.call("Target.activateTarget", {"targetId": target_id})
             except Exception:
                 pass
 
@@ -1581,11 +2710,53 @@ class PageManager:
             "url": url_final,
         }
 
-        # 立即入组
-        if group:
-            move_result = self.group_move(group, [target_id])
-            resp["group"] = group
+        # CDP 新建页面必须移入固定自动化分组，失败则关闭页面，避免留下未分组自动化 tab。
+        effective_group = self._automation_group_name
+        if requested_group and requested_group != effective_group:
+            resp["requested_group_ignored"] = requested_group
+        elif group and group != effective_group:
+            resp["requested_group_ignored"] = group
+        try:
+            move_result = self._ensure_automation_group(target_id)
+            resp["group"] = effective_group
             resp["group_ok"] = move_result.get("ok", False)
+            if not move_result.get("ok", False):
+                group_error = move_result.get("error", "")
+                try:
+                    self._cdp.call("Target.closeTarget", {"targetId": target_id})
+                except Exception:
+                    pass
+                return {
+                    "ok": False,
+                    "error": f"open_tab 被阻止：无法加入固定分组 {effective_group}: {group_error}",
+                    "targetId": target_id,
+                    "target_closed": True,
+                    "group": effective_group,
+                    "group_error": group_error,
+                }
+        except Exception as exc:
+            try:
+                self._cdp.call("Target.closeTarget", {"targetId": target_id})
+            except Exception:
+                pass
+            return {
+                "ok": False,
+                "error": f"open_tab 被阻止：无法加入固定分组 {effective_group}: {exc}",
+                "targetId": target_id,
+                "target_closed": True,
+                "group": effective_group,
+                "group_error": str(exc),
+            }
+
+        if activate:
+            try:
+                self._cdp.call("Target.activateTarget", {"targetId": target_id})
+            except Exception:
+                pass
+
+        if alias:
+            bind_result = self.bind_tab(alias, target=target_id)
+            resp["alias"] = bind_result.get("alias", "")
 
         return resp
 
@@ -1600,6 +2771,9 @@ class PageManager:
         self._cdp.call("Target.closeTarget", {"targetId": target_id})
         # 清理 session 缓存
         self._invalidate_session(target_id)
+        removed_aliases = self._remove_aliases_for_target(target_id)
+        for g in self._tab_groups.values():
+            g["targets"] = [t for t in g.get("targets", []) if t != target_id]
         # 等待 targetDestroyed 事件刷新 pages 缓存
         import time as _time
         _time.sleep(0.2)
@@ -1607,7 +2781,7 @@ class PageManager:
             self._cdp.call("Target.getTargets")
         except Exception:
             pass
-        return {"ok": True, "targetId": target_id, "title": title}
+        return {"ok": True, "targetId": target_id, "title": title, "removed_aliases": removed_aliases}
 
     # =================================================================
     # 标签页群组管理（Chrome 原生 Tab Groups）
@@ -1702,6 +2876,62 @@ class PageManager:
                 result.append(chrome_id)
         return result
 
+    def _verify_target_in_chrome_group(self, target_id: str, group_name: str) -> dict:
+        """反查 Chrome 原生标签组，确认目标 tab 确实进入指定组。"""
+        self._find_extension_sw()
+        tab_ids = self._chrome_tab_ids_from_targets([target_id])
+        if not tab_ids:
+            return {"ok": False, "error": "无法将 targetId 映射到 Chrome tab ID"}
+
+        tab_id = tab_ids[0]
+        tab_info = self._ext_eval(
+            self._ext_sw_tabs,
+            f"chrome.tabs.get({tab_id}).then(t => JSON.stringify({{id:t.id, groupId:t.groupId, url:t.url, title:t.title}}))",
+        )
+        group_id = tab_info.get("groupId")
+        if group_id is None or int(group_id) < 0:
+            return {"ok": False, "error": "Chrome tab 当前未加入任何原生标签组", "tab_id": tab_id}
+
+        expected_group_id = (self._tab_groups.get(group_name) or {}).get("chrome_group_id")
+        if expected_group_id is not None and int(group_id) != int(expected_group_id):
+            return {
+                "ok": False,
+                "error": f"Chrome tab groupId={group_id} 与内存记录 groupId={expected_group_id} 不一致",
+                "tab_id": tab_id,
+                "chrome_group_id": group_id,
+            }
+
+        title = ""
+        color = ""
+        if self._ext_sw_tabgroups:
+            try:
+                group_info = self._ext_eval(
+                    self._ext_sw_tabgroups,
+                    f"chrome.tabGroups.get({group_id}).then(g => JSON.stringify({{id:g.id, title:g.title, color:g.color}}))",
+                )
+                title = str(group_info.get("title") or "")
+                color = str(group_info.get("color") or "")
+                if title != group_name:
+                    return {
+                        "ok": False,
+                        "error": f"Chrome 原生标签组名称不匹配: actual={title!r}, expected={group_name!r}",
+                        "tab_id": tab_id,
+                        "chrome_group_id": group_id,
+                    }
+            except Exception as exc:
+                return {"ok": False, "error": f"读取 Chrome 标签组信息失败: {exc}", "tab_id": tab_id}
+
+        # 反查成功后同步内存中的 group id，避免 daemon 重启后复用已有组时信息漂移。
+        if group_name in self._tab_groups:
+            self._tab_groups[group_name]["chrome_group_id"] = int(group_id)
+        return {
+            "ok": True,
+            "tab_id": tab_id,
+            "chrome_group_id": int(group_id),
+            "title": title,
+            "color": color,
+        }
+
     def _resolve_targets(self, targets: list[str]) -> list[str]:
         """批量解析 target 标识为 targetId 列表。
 
@@ -1739,6 +2969,62 @@ class PageManager:
         except Exception:
             url = ""
         return {"targetId": target_id, "title": title, "url": url}
+
+    def _find_chrome_group_id_by_name(self, name: str) -> int | None:
+        """按组名查找已有 Chrome 原生标签组，供 daemon 重启后复用。"""
+        self._find_extension_sw()
+        if not self._ext_sw_tabgroups:
+            return None
+        try:
+            groups = self._ext_eval(
+                self._ext_sw_tabgroups,
+                f"chrome.tabGroups.query({{title: {json.dumps(name)}}}).then(gs => JSON.stringify(gs.map(g => ({{id: g.id, title: g.title, color: g.color}}))))",
+            )
+        except Exception:
+            return None
+        if isinstance(groups, list) and groups:
+            gid = groups[0].get("id")
+            try:
+                return int(gid)
+            except Exception:
+                return None
+        return None
+
+    def _ensure_automation_group(self, target_id: str) -> dict:
+        """确保 CDP 新开标签页进入固定自动化分组。"""
+        name = self._automation_group_name
+        color = self._automation_group_color
+        last_result: dict[str, Any] = {"ok": False, "error": "unknown"}
+        for attempt in range(4):
+            if name in self._tab_groups:
+                last_result = self.group_move(name, [target_id])
+            else:
+                existing_gid = self._find_chrome_group_id_by_name(name)
+                if existing_gid is not None:
+                    self._tab_groups[name] = {
+                        "color": color,
+                        "targets": [],
+                        "chrome_group_id": existing_gid,
+                    }
+                    last_result = self.group_move(name, [target_id])
+                else:
+                    last_result = self.group_create(name, [target_id], color)
+
+            if last_result.get("ok"):
+                verify_result = self._verify_target_in_chrome_group(target_id, name)
+                if verify_result.get("ok"):
+                    last_result["verified"] = verify_result
+                    return last_result
+                last_result = {
+                    "ok": False,
+                    "error": f"固定分组反查失败: {verify_result.get('error', 'unknown')}",
+                    "verify": verify_result,
+                }
+            if "无法将 targetId 映射到 Chrome tab ID" not in str(last_result.get("error", "")):
+                return last_result
+            time.sleep(0.25 * (attempt + 1))
+
+        return last_result
 
     def group_create(self, name: str, targets: list[str] | None = None, color: str = "blue") -> dict:
         """创建 Chrome 原生标签页群组。
@@ -1796,10 +3082,15 @@ class PageManager:
         if chrome_group_id is not None:
             self._find_extension_sw()
             new_tab_ids = self._chrome_tab_ids_from_targets(added)
-            if new_tab_ids:
-                self._ext_eval(self._ext_sw_tabs,
-                    f"chrome.tabs.group({{tabIds: {json.dumps(new_tab_ids)}, groupId: {chrome_group_id}}}).then(gid => JSON.stringify({{ok:true}}))"
-                )
+            if len(new_tab_ids) != len(added):
+                return {"ok": False, "error": "无法将所有 targetId 映射到 Chrome tab ID"}
+            self._ext_eval(self._ext_sw_tabs,
+                f"chrome.tabs.group({{tabIds: {json.dumps(new_tab_ids)}, groupId: {chrome_group_id}}}).then(gid => JSON.stringify({{ok:true, groupId:gid}}))"
+            )
+            for tid in added:
+                verify_result = self._verify_target_in_chrome_group(tid, name)
+                if not verify_result.get("ok"):
+                    return {"ok": False, "error": f"Chrome 原生分组反查失败: {verify_result.get('error')}", "verify": verify_result}
 
         self._tab_groups[name]["targets"].extend(added)
         tabs = [self._get_page_info(t) for t in added]
@@ -1833,16 +3124,19 @@ class PageManager:
 
     def group_list(self, name: str = "") -> dict:
         """列出群组及其标签页。name 为空时列出所有群组。"""
+        live_ids = {p.get("targetId", "") for p in self._cdp.get_pages()}
         if name:
             if name not in self._tab_groups:
                 return {"ok": False, "error": f"群组 '{name}' 不存在"}
             g = self._tab_groups[name]
+            g["targets"] = [t for t in g.get("targets", []) if t in live_ids]
             tabs = [self._get_page_info(t) for t in g["targets"]]
             return {"ok": True, "groups": [{
                 "name": name, "color": g["color"], "count": len(tabs), "tabs": tabs,
             }]}
         groups = []
         for gname, g in self._tab_groups.items():
+            g["targets"] = [t for t in g.get("targets", []) if t in live_ids]
             tabs = [self._get_page_info(t) for t in g["targets"]]
             groups.append({
                 "name": gname, "color": g["color"], "count": len(tabs), "tabs": tabs,
@@ -1955,20 +3249,23 @@ class PageManager:
         # 加入目标群组（去重）
         existing = set(self._tab_groups[name]["targets"])
         added = [t for t in resolved if t not in existing]
-        self._tab_groups[name]["targets"].extend(added)
 
         # Chrome 原生 API: 移入目标 group
         chrome_group_id = self._tab_groups[name].get("chrome_group_id")
         if chrome_group_id is not None and added:
-            try:
-                self._find_extension_sw()
-                new_tab_ids = self._chrome_tab_ids_from_targets(added)
-                if new_tab_ids:
-                    self._ext_eval(self._ext_sw_tabs,
-                        f"chrome.tabs.group({{tabIds: {json.dumps(new_tab_ids)}, groupId: {chrome_group_id}}}).then(gid => JSON.stringify({{ok:true}}))"
-                    )
-            except Exception:
-                pass
+            self._find_extension_sw()
+            new_tab_ids = self._chrome_tab_ids_from_targets(added)
+            if len(new_tab_ids) != len(added):
+                return {"ok": False, "error": "无法将所有 targetId 映射到 Chrome tab ID"}
+            self._ext_eval(self._ext_sw_tabs,
+                f"chrome.tabs.group({{tabIds: {json.dumps(new_tab_ids)}, groupId: {chrome_group_id}}}).then(gid => JSON.stringify({{ok:true, groupId:gid}}))"
+            )
+            for tid in added:
+                verify_result = self._verify_target_in_chrome_group(tid, name)
+                if not verify_result.get("ok"):
+                    return {"ok": False, "error": f"Chrome 原生分组反查失败: {verify_result.get('error')}", "verify": verify_result}
+
+        self._tab_groups[name]["targets"].extend(added)
 
         tabs = [self._get_page_info(t) for t in added]
         total = len(self._tab_groups[name]["targets"])
@@ -2165,36 +3462,76 @@ class PageManager:
     # =================================================================
 
     def editor_get(self, target: str = "active") -> dict:
-        """读取 Monaco/CodeMirror 编辑器当前内容。
+        """读取编辑器当前内容（自动探测 Monaco / CodeMirror / Ace / textarea）。
 
-        自动探测编辑器类型，返回 {"ok": True, "type": "monaco"|"codemirror"|"textarea",
-        "value": "...", "language": "..."}.
+        返回 {"ok": True, "type": "monaco"|"codemirror6"|"codemirror5"|"ace"|"textarea",
+               "value": "...", "language": ""}
         """
         target_id = self.resolve_target(target)
         js = r"""
         (() => {
-            // 1. Monaco: 通过 textarea.inputarea 的实例链
-            const ta = document.querySelector('textarea.inputarea.monaco-mouse-cursor-text')
-                    || document.querySelector('textarea.inputarea');
+            function isVisible(el) {
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity || '1') !== 0;
+            }
+            function dialogRoots() {
+                return [...document.querySelectorAll('.ant-modal-root, .ant-modal-wrap, .ant-modal, [role="dialog"]')].filter(isVisible);
+            }
+            function pickInDialog(selector) {
+                const roots = dialogRoots();
+                for (const root of roots) {
+                    const found = root.querySelector(selector);
+                    if (found && isVisible(found)) return found;
+                }
+                return null;
+            }
+            function pickVisible(selector) {
+                const els = [...document.querySelectorAll(selector)].filter(isVisible);
+                if (!els.length) return null;
+                els.sort((a, b) => {
+                    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+                    return (rb.width * rb.height) - (ra.width * ra.height);
+                });
+                return els[0];
+            }
+
+            // 1. Monaco
+            const ta = pickInDialog('textarea.inputarea.monaco-mouse-cursor-text, textarea.inputarea')
+                    || pickVisible('textarea.inputarea.monaco-mouse-cursor-text, textarea.inputarea');
             if (ta) {
-                // Monaco 把 model 存在 view-lines 的同级或祖先的 __proto__ 链上
-                // 最稳妥方式：读 textarea.value（Monaco 同步更新）
                 return JSON.stringify({ok: true, type: 'monaco', value: ta.value, language: ''});
             }
             // 2. CodeMirror 6
-            const cm6 = document.querySelector('.cm-editor');
+            const cm6 = pickInDialog('.cm-editor') || pickVisible('.cm-editor');
             if (cm6 && cm6.cmView && cm6.cmView.view) {
                 const doc = cm6.cmView.view.state.doc.toString();
                 return JSON.stringify({ok: true, type: 'codemirror6', value: doc, language: ''});
             }
             // 3. CodeMirror 5
-            const cm5 = document.querySelector('.CodeMirror');
+            const cm5 = pickInDialog('.CodeMirror') || pickVisible('.CodeMirror');
             if (cm5 && cm5.CodeMirror) {
                 const doc = cm5.CodeMirror.getValue();
                 return JSON.stringify({ok: true, type: 'codemirror5', value: doc, language: ''});
             }
-            // 4. 普通 textarea
-            const anyTa = document.querySelector('textarea');
+            // 4. Ace Editor（通过 DOM 元素上挂载的实例或全局 ace 对象）
+            const aceEl = pickInDialog('.ace_editor') || pickVisible('.ace_editor');
+            if (aceEl) {
+                // 方式一：DOM 元素上的 env.editor 引用
+                var editor = aceEl.env && aceEl.env.editor;
+                // 方式二：全局 ace.edit()
+                if (!editor && typeof ace !== 'undefined') {
+                    try { editor = ace.edit(aceEl); } catch(e) {}
+                }
+                if (editor && typeof editor.getValue === 'function') {
+                    const val = editor.getValue();
+                    const mode = (editor.session && editor.session.$modeId) || '';
+                    return JSON.stringify({ok: true, type: 'ace', value: val, language: mode});
+                }
+            }
+            // 5. 普通 textarea（面积足够大的才认为是编辑器）
+            const anyTa = pickInDialog('textarea') || pickVisible('textarea');
             if (anyTa && anyTa.getBoundingClientRect().width > 100) {
                 return JSON.stringify({ok: true, type: 'textarea', value: anyTa.value, language: ''});
             }
@@ -2205,17 +3542,125 @@ class PageManager:
         return json.loads(raw) if isinstance(raw, str) else {"ok": False, "error": "unexpected"}
 
     def editor_set(self, text: str, target: str = "active", append: bool = False) -> dict:
-        """设置 Monaco/CodeMirror 编辑器内容（整段写入）。
+        """设置编辑器内容（整段写入），自动探测 Monaco / CodeMirror / Ace / textarea。
 
-        通过 CDP Input.insertText 实现，会触发框架的 onChange 事件。
+        对 Ace Editor 优先通过 JS API 直接写入（避免 insertText 兼容问题）。
+        对其他编辑器通过 CDP Input.insertText 实现。
         :param text: 要写入的完整文本
         :param append: True 时追加到末尾，False 时全选后替换
         """
         target_id = self.resolve_target(target)
+
+        focus_js = r"""
+        (() => {
+            function isVisible(el) {
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity || '1') !== 0;
+            }
+            function dialogRoots() {
+                return [...document.querySelectorAll('.ant-modal-root, .ant-modal-wrap, .ant-modal, [role="dialog"]')].filter(isVisible);
+            }
+            function pickInDialog(selector) {
+                const roots = dialogRoots();
+                for (const root of roots) {
+                    const found = root.querySelector(selector);
+                    if (found && isVisible(found)) return found;
+                }
+                return null;
+            }
+            function pickVisible(selector) {
+                const els = [...document.querySelectorAll(selector)].filter(isVisible);
+                if (!els.length) return null;
+                els.sort((a, b) => {
+                    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+                    return (rb.width * rb.height) - (ra.width * ra.height);
+                });
+                return els[0];
+            }
+
+            const ta = pickInDialog('textarea.inputarea.monaco-mouse-cursor-text, textarea.inputarea')
+                    || pickVisible('textarea.inputarea.monaco-mouse-cursor-text, textarea.inputarea');
+            if (ta) {
+                ta.focus();
+                return 'monaco';
+            }
+            const cm6 = pickInDialog('.cm-editor') || pickVisible('.cm-editor');
+            if (cm6) {
+                cm6.focus();
+                return 'codemirror6';
+            }
+            const cm5 = pickInDialog('.CodeMirror textarea') || pickVisible('.CodeMirror textarea');
+            if (cm5) {
+                cm5.focus();
+                return 'codemirror5';
+            }
+            const anyTa = pickInDialog('textarea') || pickVisible('textarea');
+            if (anyTa) {
+                anyTa.focus();
+                return 'textarea';
+            }
+            return 'none';
+        })()
+        """
+
+        focused_editor = self._evaluate(target_id, focus_js)
+
+        # --- 先尝试 Ace Editor JS 路径（最可靠）---
+        escaped = json.dumps(text)
+        ace_js = f"""
+        (() => {{
+            function isVisible(el) {{
+                if (!el) return false;
+                const rect = el.getBoundingClientRect();
+                const style = getComputedStyle(el);
+                return rect.width > 0 && rect.height > 0 && style.display !== 'none' && style.visibility !== 'hidden' && parseFloat(style.opacity || '1') !== 0;
+            }}
+            function dialogRoots() {{
+                return [...document.querySelectorAll('.ant-modal-root, .ant-modal-wrap, .ant-modal, [role="dialog"]')].filter(isVisible);
+            }}
+            function pickInDialog(selector) {{
+                const roots = dialogRoots();
+                for (const root of roots) {{
+                    const found = root.querySelector(selector);
+                    if (found && isVisible(found)) return found;
+                }}
+                return null;
+            }}
+            function pickVisible(selector) {{
+                const els = [...document.querySelectorAll(selector)].filter(isVisible);
+                if (!els.length) return null;
+                els.sort((a, b) => {{
+                    const ra = a.getBoundingClientRect(), rb = b.getBoundingClientRect();
+                    return (rb.width * rb.height) - (ra.width * ra.height);
+                }});
+                return els[0];
+            }}
+            var aceEl = pickInDialog('.ace_editor') || pickVisible('.ace_editor');
+            if (!aceEl) return 'no_ace';
+            var editor = (aceEl.env && aceEl.env.editor)
+                      || (typeof ace !== 'undefined' && (() => {{ try {{ return ace.edit(aceEl); }} catch(e) {{}} }})());
+            if (!editor || typeof editor.setValue !== 'function') return 'no_editor';
+            if ({json.dumps(append)}) {{
+                editor.navigateFileEnd();
+                editor.insert({escaped});
+            }} else {{
+                editor.setValue({escaped}, -1);   // -1 = 光标置顶
+            }}
+            return 'ok';
+        }})()
+        """
+        ace_result = self._evaluate(target_id, ace_js)
+        if ace_result == "ok":
+            return {"ok": True, "type": "ace", "length": len(text), "append": append}
+
+        # --- 回退到 CDP Input 路径（Monaco / CodeMirror / textarea）---
+        if focused_editor == 'none':
+            raise RuntimeError("No visible editor found")
         _meta = 4 if sys.platform == "darwin" else 2  # Mac: Meta(Cmd), Others: Ctrl
 
         if append:
-            # Cmd+End 移到末尾
             self.page_call(target_id, "Input.dispatchKeyEvent", {
                 "type": "rawKeyDown", "key": "End",
                 "windowsVirtualKeyCode": 35,
@@ -2237,10 +3682,8 @@ class PageManager:
                 "code": "KeyA", "windowsVirtualKeyCode": 65,
             })
 
-        # insertText 一次性写入整段文本（触发 onChange）
         self.page_call(target_id, "Input.insertText", {"text": text})
-
-        return {"ok": True, "length": len(text), "append": append}
+        return {"ok": True, "type": "input", "length": len(text), "append": append}
 
     def editor_type(self, text: str, target: str = "active") -> dict:
         """在编辑器中逐字符输入文本（模拟真实打字）。
@@ -2578,10 +4021,13 @@ class PageManager:
 
         # 启用 Network 域
         self.page_call(target_id, "Network.enable", {})
+        started_at = time.time()
 
         with self._net_lock:
             self._net_capture_active[sid] = True
             self._net_capture_buffer[sid] = []
+            self._net_last_event_at[sid] = started_at
+            self._net_capture_started_at[sid] = started_at
             # 清理该 session 的旧请求映射
             stale = [k for k, v in self._net_request_map.items()
                      if v.get("sessionId") == sid]
@@ -2603,16 +4049,182 @@ class PageManager:
                 "follow": follow,
                 "message": "network capture started" + (" (follow mode)" if follow else "")}
 
+    @staticmethod
+    def _capture_match_filter(
+        req: dict[str, Any],
+        method_filter: str = "",
+        url_filter: str = "",
+        exclude_domain: str = "",
+        status_filter: str = "",
+    ) -> bool:
+        """判断单条请求是否命中过滤条件。"""
+        method = str(req.get("method", "")).upper()
+        url = str(req.get("url", ""))
+        status = str(req.get("status", ""))
+        if method_filter and method != method_filter.upper():
+            return False
+        if url_filter and url_filter.lower() not in url.lower():
+            return False
+        if exclude_domain and exclude_domain.lower() in url.lower():
+            return False
+        if status_filter and status != str(status_filter):
+            return False
+        return True
+
+    @staticmethod
+    def _capture_match_until(req: dict[str, Any], until_match: str = "") -> bool:
+        """判断单条请求是否命中提前结束关键字。"""
+        if not until_match:
+            return False
+        needle = until_match.lower()
+        url = str(req.get("url", "")).lower()
+        method = str(req.get("method", "")).lower()
+        status = str(req.get("status", "")).lower()
+        return needle in url or needle in method or needle in status
+
+    def _capture_sessions_snapshot(
+        self,
+        origin_sid: str,
+    ) -> tuple[list[str], dict[str, dict[str, Any]]]:
+        """返回当前抓包相关 session 列表和 follow tab 快照。"""
+        with self._net_lock:
+            follow_tabs_info = dict(self._net_follow_tabs)
+        all_sessions = [origin_sid]
+        for finfo in follow_tabs_info.values():
+            fsid = str(finfo.get("sessionId") or "")
+            if fsid and fsid not in all_sessions:
+                all_sessions.append(fsid)
+        return all_sessions, follow_tabs_info
+
+    def _capture_requests_snapshot(
+        self,
+        origin_sid: str,
+    ) -> tuple[list[dict[str, Any]], dict[str, dict[str, Any]]]:
+        """读取当前已缓存请求快照，供 idle / until-match 判定。"""
+        all_sessions, follow_tabs_info = self._capture_sessions_snapshot(origin_sid)
+        with self._net_lock:
+            requests = [
+                dict(item)
+                for sid in all_sessions
+                for item in self._net_capture_buffer.get(sid, [])
+            ]
+        return requests, follow_tabs_info
+
+    def _wait_capture_ready(
+        self,
+        target_id: str,
+        origin_sid: str,
+        wait_ms: int = 0,
+        idle_ms: int = 0,
+        until_match: str = "",
+    ) -> tuple[bool, list[dict[str, Any]], dict[str, dict[str, Any]]]:
+        """在 stop 前等待固定窗口、网络空闲或目标请求出现。"""
+        matched = False
+        requests_snapshot: list[dict[str, Any]] = []
+        follow_tabs_info: dict[str, dict[str, Any]] = {}
+        remaining_wait = max(0, int(wait_ms))
+        while remaining_wait > 0:
+            sleep_ms = min(200, remaining_wait)
+            time.sleep(sleep_ms / 1000.0)
+            self._drain_network_events(target_id, drain_ms=sleep_ms)
+            requests_snapshot, follow_tabs_info = self._capture_requests_snapshot(origin_sid)
+            matched = any(self._capture_match_until(req, until_match) for req in requests_snapshot)
+            if matched:
+                return True, requests_snapshot, follow_tabs_info
+            remaining_wait -= sleep_ms
+
+        if idle_ms > 0:
+            idle_seconds = max(0.1, int(idle_ms) / 1000.0)
+            idle_deadline = time.time() + max(3.0, idle_seconds * 8)
+            while True:
+                self._drain_network_events(target_id, drain_ms=min(max(int(idle_ms), 200), 1000))
+                requests_snapshot, follow_tabs_info = self._capture_requests_snapshot(origin_sid)
+                matched = any(self._capture_match_until(req, until_match) for req in requests_snapshot)
+                if matched:
+                    return True, requests_snapshot, follow_tabs_info
+                all_sessions, _ = self._capture_sessions_snapshot(origin_sid)
+                with self._net_lock:
+                    last_event = max(
+                        (self._net_last_event_at.get(sid, self._net_capture_started_at.get(sid, time.time()))
+                         for sid in all_sessions),
+                        default=time.time(),
+                    )
+                if time.time() - last_event >= idle_seconds:
+                    break
+                if time.time() >= idle_deadline:
+                    break
+                time.sleep(min(0.2, idle_seconds / 2))
+
+        if not requests_snapshot:
+            requests_snapshot, follow_tabs_info = self._capture_requests_snapshot(origin_sid)
+        return matched, requests_snapshot, follow_tabs_info
+
+    @staticmethod
+    def _response_size_hint(req_info: dict[str, Any]) -> int:
+        """估算响应体大小，优先使用 encodedDataLength / Content-Length。"""
+        encoded_len = req_info.get("encodedDataLength")
+        if isinstance(encoded_len, (int, float)) and encoded_len > 0:
+            return int(encoded_len)
+        headers = req_info.get("responseHeaders") or {}
+        raw = headers.get("content-length") or headers.get("Content-Length")
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return 0
+
+    def navigate_page(
+        self,
+        target: str = "active",
+        url: str | None = None,
+        reload: bool = False,
+    ) -> dict:
+        """导航到 URL 或刷新当前页（Page.navigate / Page.reload）。"""
+        target_id = self.resolve_target(target)
+        if reload and not url:
+            self.page_call(target_id, "Page.reload", {"ignoreCache": False})
+            return {"ok": True, "target_id": target_id, "action": "reload"}
+        if not url:
+            return {"ok": False, "error": "missing 'url' (or set reload=true)"}
+        self.page_call(target_id, "Page.navigate", {"url": url})
+        return {"ok": True, "target_id": target_id, "action": "navigate", "url": url}
+
     def network_capture_stop(self, target: str = "active",
-                              get_body: bool = False) -> dict:
+                              get_body: bool = False,
+                              wait_ms: int = 0,
+                              body_mode: str = "",
+                              idle_ms: int = 0,
+                              max_bodies: int = 0,
+                              max_body_bytes: int = 0,
+                              method_filter: str = "",
+                              url_filter: str = "",
+                              exclude_domain: str = "",
+                              status_filter: str = "",
+                              until_match: str = "") -> dict:
         """停止网络抓包，返回捕获的 API 请求列表。
 
         :param get_body: 是否同时获取响应 body（较慢，按需开启）
+        :param wait_ms: stop 前额外等待并 drain 网络事件（SPA 场景建议 3000~8000）
+        :param body_mode: body 抓取策略，支持 none / filtered / all
+        :param idle_ms: 额外等待网络空闲窗口，适合替代固定 wait_ms
+        :param max_bodies: 最多抓取多少个响应 body，0 表示不限
+        :param max_body_bytes: 超过阈值时跳过 body 获取，0 表示不限
+        :param until_match: 命中关键字后提前结束等待
 
         follow 模式下会聚合所有跟踪 tab 的请求，并返回新 tab 信息。
         """
         target_id = self.resolve_target(target)
         sid = self._get_or_attach(target_id)
+        body_mode_val = str(body_mode or ("all" if get_body else "none")).strip().lower()
+        if body_mode_val not in {"none", "filtered", "all"}:
+            body_mode_val = "all" if get_body else "none"
+
+        self._wait_capture_ready(
+            target_id=target_id,
+            origin_sid=sid,
+            wait_ms=wait_ms,
+            idle_ms=idle_ms,
+            until_match=until_match,
+        )
 
         # 先刷出堆积事件（包括 follow 新 tab）
         self._drain_network_events(target_id, drain_ms=1200)
@@ -2648,6 +4260,9 @@ class PageManager:
                      if v.get("sessionId") in all_sessions]
             for k in stale:
                 del self._net_request_map[k]
+            for s in all_sessions:
+                self._net_last_event_at.pop(s, None)
+                self._net_capture_started_at.pop(s, None)
 
             # 清理 follow 状态
             self._net_follow_origin = ""
@@ -2656,22 +4271,110 @@ class PageManager:
             self._net_follow_tabs.clear()
 
         # 可选：获取响应 body
-        if get_body:
+        BODY_SIZE_THRESHOLD = 512 * 1024  # 512KB → 大于此值写临时文件
+        body_fetch: dict[str, Any] = {
+            "mode": body_mode_val,
+            "selected": 0,
+            "fetched": 0,
+            "skipped_unmatched": 0,
+            "skipped_limit": 0,
+            "skipped_too_large": 0,
+            "skipped_error": 0,
+            "max_bodies": max(0, int(max_bodies or 0)),
+            "max_body_bytes": max(0, int(max_body_bytes or 0)),
+        }
+        if body_mode_val != "none":
+            import tempfile as _tmpmod, base64 as _b64, gzip as _gz
+            selected_requests: list[dict[str, Any]] = []
             for req_info in requests:
+                matched = body_mode_val == "all" or (
+                    body_mode_val == "filtered"
+                    and (
+                        self._capture_match_filter(
+                            req_info,
+                            method_filter=method_filter,
+                            url_filter=url_filter,
+                            exclude_domain=exclude_domain,
+                            status_filter=status_filter,
+                        )
+                        or self._capture_match_until(req_info, until_match)
+                    )
+                )
+                if not matched:
+                    body_fetch["skipped_unmatched"] += 1
+                    req_info["responseBodySkipped"] = "unmatched"
+                    continue
+                if body_fetch["max_bodies"] and len(selected_requests) >= body_fetch["max_bodies"]:
+                    body_fetch["skipped_limit"] += 1
+                    req_info["responseBodySkipped"] = "max_bodies"
+                    continue
+                size_hint = self._response_size_hint(req_info)
+                if body_fetch["max_body_bytes"] and size_hint and size_hint > body_fetch["max_body_bytes"]:
+                    body_fetch["skipped_too_large"] += 1
+                    req_info["responseBodySkipped"] = "max_body_bytes"
+                    req_info["responseBodySize"] = size_hint
+                    continue
+                selected_requests.append(req_info)
+
+            body_fetch["selected"] = len(selected_requests)
+            for req_info in selected_requests:
                 rid = req_info.get("requestId", "")
                 source_sid = req_info.get("sessionId", "")
                 if rid and source_sid:
-                    # 找到对应的 target
                     req_tid = self._session_to_target(source_sid) or target_id
                     try:
                         body_resp = self.page_call(
                             req_tid, "Network.getResponseBody",
                             {"requestId": rid}
                         )
-                        req_info["responseBody"] = body_resp.get("body", "")
-                        req_info["base64Encoded"] = body_resp.get("base64Encoded", False)
+                        raw_body: str = body_resp.get("body", "")
+                        is_b64: bool = body_resp.get("base64Encoded", False)
+
+                        # #18 base64 自动解码
+                        if is_b64 and raw_body:
+                            try:
+                                decoded_bytes = _b64.b64decode(raw_body)
+                                # 尝试 gzip 解压
+                                try:
+                                    decoded_bytes = _gz.decompress(decoded_bytes)
+                                except (_gz.BadGzipFile, OSError):
+                                    pass  # 不是 gzip，直接用解码后的字节
+                                # 尝试 UTF-8 解码，否则保留 base64
+                                try:
+                                    raw_body = decoded_bytes.decode("utf-8")
+                                    is_b64 = False
+                                except UnicodeDecodeError:
+                                    raw_body = _b64.b64encode(decoded_bytes).decode()
+                            except Exception:
+                                pass  # 解码失败保留原样
+
+                        # #12 大 body 写临时文件
+                        body_size = len(raw_body.encode("utf-8") if isinstance(raw_body, str) else raw_body)
+                        if body_fetch["max_body_bytes"] and body_size > body_fetch["max_body_bytes"]:
+                            req_info["responseBody"] = None
+                            req_info["responseBodySize"] = body_size
+                            req_info["responseBodySkipped"] = "max_body_bytes_after_fetch"
+                            body_fetch["skipped_too_large"] += 1
+                            continue
+                        if body_size > BODY_SIZE_THRESHOLD:
+                            tmp_dir = _tmpmod.gettempdir()
+                            safe_rid = rid.replace(".", "_").replace("/", "_")[:40]
+                            body_file = os.path.join(tmp_dir, f"cdp_body_{safe_rid}.txt")
+                            with open(body_file, "w", encoding="utf-8") as f:
+                                f.write(raw_body)
+                            req_info["responseBody"] = None
+                            req_info["responseBodyFile"] = body_file
+                            req_info["responseBodySize"] = body_size
+                            req_info["base64Encoded"] = False
+                        else:
+                            req_info["responseBody"] = raw_body
+                            req_info["responseBodySize"] = body_size
+                            req_info["base64Encoded"] = is_b64
+                        body_fetch["fetched"] += 1
                     except Exception:
                         req_info["responseBody"] = None
+                        req_info["responseBodySkipped"] = "fetch_error"
+                        body_fetch["skipped_error"] += 1
 
         # 禁用 Network 域（减少开销）
         try:
@@ -2699,10 +4402,41 @@ class PageManager:
         result: dict[str, Any] = {
             "ok": True, "target_id": target_id,
             "count": len(requests), "requests": requests,
+            "body_fetch": body_fetch,
         }
         if new_tabs:
             result["new_tabs"] = new_tabs
         return result
+
+    def network_capture_peek(self, target: str = "active") -> dict:
+        """读取当前抓包快照，不停止抓包也不清空缓冲区。"""
+        target_id = self.resolve_target(target)
+        sid = self._get_or_attach(target_id)
+
+        with self._net_lock:
+            if not self._net_capture_active.get(sid):
+                return {"ok": False, "error": "当前 target 未处于抓包状态"}
+
+        self._drain_network_events(target_id, drain_ms=200)
+        requests, _ = self._capture_requests_snapshot(sid)
+        all_sessions, _ = self._capture_sessions_snapshot(sid)
+
+        with self._net_lock:
+            last_event_at = max(
+                (
+                    self._net_last_event_at.get(session_id, 0.0)
+                    for session_id in all_sessions
+                ),
+                default=self._net_capture_started_at.get(sid, 0.0),
+            )
+
+        return {
+            "ok": True,
+            "target_id": target_id,
+            "count": len(requests),
+            "requests": requests,
+            "last_event_at": last_event_at,
+        }
 
     def network_capture_export(self, requests: list[dict],
                                  fmt: str = "python") -> str:
@@ -2737,12 +4471,13 @@ class PageManager:
             lines.append(f"# [{i+1}] {method} {url}")
             lines.append(f"# 响应状态: {status}")
 
-            # 过滤掉自动添加的浏览器头
+            # 过滤掉自动添加的浏览器头（保留业务认证头如 uid / csrf-token / micro-app-* 等）
             skip_headers = {
                 "host", "connection", "content-length",
                 "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
                 "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
                 "upgrade-insecure-requests", "accept-encoding",
+                "cache-control", "pragma",
             }
             filtered_headers = {
                 k: v for k, v in headers.items()
@@ -2921,6 +4656,489 @@ class PageManager:
         result["original_url"] = req.get("url")
         return result
 
+    # =================================================================
+    # eval-js / capture-headers / scan-shortcuts
+    # =================================================================
+
+    # =================================================================
+    # localStorage / sessionStorage
+    # =================================================================
+
+    def local_storage_get(
+        self,
+        key: str,
+        storage: str = "local",
+        target: str = "active",
+    ) -> dict:
+        """读取 localStorage 或 sessionStorage 中指定 key 的值。
+
+        :param key:     存储键名（空字符串则返回所有 key）
+        :param storage: "local"（默认）或 "session"
+        :return: {"ok": True, "key": key, "value": <str|None>, "parsed": <obj if JSON>}
+        """
+        target_id = self.resolve_target(target)
+        obj = "localStorage" if storage != "session" else "sessionStorage"
+
+        if key:
+            js = f'(function(){{ var v = {obj}.getItem({json.dumps(key)}); return JSON.stringify({{found: v !== null, value: v}}); }})()'
+            raw = self._evaluate(target_id, js)
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else raw
+            except Exception:
+                return {"ok": False, "error": f"JS eval failed: {raw}"}
+            value = data.get("value")
+            parsed = None
+            if value:
+                try:
+                    parsed = json.loads(value)
+                except Exception:
+                    pass
+            return {"ok": True, "key": key, "value": value, "parsed": parsed,
+                    "found": data.get("found", False), "storage": obj}
+        else:
+            # 返回所有 key-value
+            js = f"""(function(){{
+                var out = {{}};
+                for (var i = 0; i < {obj}.length; i++) {{
+                    var k = {obj}.key(i);
+                    out[k] = {obj}.getItem(k);
+                }}
+                return JSON.stringify(out);
+            }})()"""
+            raw = self._evaluate(target_id, js)
+            try:
+                data = json.loads(raw) if isinstance(raw, str) else (raw or {})
+            except Exception:
+                data = {}
+            return {"ok": True, "storage": obj, "items": data, "count": len(data)}
+
+    def local_storage_set(
+        self,
+        key: str,
+        value: str,
+        storage: str = "local",
+        target: str = "active",
+    ) -> dict:
+        """写入 localStorage 或 sessionStorage。
+
+        :param key:   键名
+        :param value: 值（字符串，如需写对象请先 json.dumps）
+        :param storage: "local" 或 "session"
+        """
+        target_id = self.resolve_target(target)
+        obj = "localStorage" if storage != "session" else "sessionStorage"
+        js = f'{obj}.setItem({json.dumps(key)}, {json.dumps(value)}); "ok"'
+        self._evaluate(target_id, js)
+        return {"ok": True, "key": key, "storage": obj}
+
+    def local_storage_remove(
+        self,
+        key: str,
+        storage: str = "local",
+        target: str = "active",
+    ) -> dict:
+        """删除 localStorage 或 sessionStorage 中指定 key。"""
+        target_id = self.resolve_target(target)
+        obj = "localStorage" if storage != "session" else "sessionStorage"
+        js = f'{obj}.removeItem({json.dumps(key)}); "ok"'
+        self._evaluate(target_id, js)
+        return {"ok": True, "key": key, "storage": obj}
+
+    def extract_metric(
+        self,
+        title: str = "",
+        api_url: str = "",
+        target: str = "active",
+    ) -> dict:
+        """从图表组件提取指标数值。
+
+        策略（按优先级）：
+        1. DOM 文本节点：从 [class*=metric]、[class*=value]、SVG text 中提取数字
+        2. 页面内 fetch REST API（api_url 不为空时）：在页面上下文 fetch，自动携带 cookie
+        3. 返回所有找到的数值供调用方选择
+
+        :param title: 指标名（如 "numRecordsIn"），用于过滤匹配的 DOM 容器
+        :param api_url: REST API 路径（如 /jobs/.../metrics?get=xxx），在页面上下文 fetch
+        """
+        target_id = self.resolve_target(target)
+
+        results: dict[str, Any] = {"ok": True, "values": [], "sources": []}
+
+        # ---- 策略1：DOM 扫描 ----
+        title_arg = json.dumps(title) if title else '""'
+        dom_js = f"""
+        (() => {{
+            var titleFilter = {title_arg}.toLowerCase();
+            var found = [];
+            // 找包含 title 关键词的容器
+            var containers = titleFilter
+                ? [...document.querySelectorAll('*')].filter(el => {{
+                    var t = (el.textContent || '').toLowerCase();
+                    return t.includes(titleFilter) && el.children.length < 10;
+                  }})
+                : [document.body];
+
+            for (var c of containers.slice(0, 5)) {{
+                // SVG text 节点
+                var svgTexts = [...c.querySelectorAll('text, tspan')].map(t => t.textContent.trim()).filter(t => /^[\d,\.\-]+$/.test(t));
+                // DOM 叶节点数值
+                var leafNums = [...c.querySelectorAll('[class*=value],[class*=metric],[class*=count],[class*=number]')]
+                    .map(el => (el.textContent || '').trim())
+                    .filter(t => /^[\d,\.\-\s]+$/.test(t) && t.length < 30);
+                // Big/Small 标签旁边的值
+                var bigSmall = [];
+                var labels = [...c.querySelectorAll('*')].filter(el => ['Big','Small','Current','Latest'].includes((el.textContent||'').trim()));
+                for (var lbl of labels) {{
+                    var sib = lbl.nextSibling || lbl.nextElementSibling;
+                    if (sib) bigSmall.push((sib.textContent||'').trim());
+                }}
+                found.push(...svgTexts, ...leafNums, ...bigSmall);
+            }}
+            return JSON.stringify({{domValues: [...new Set(found)].filter(v => v && v !== '-')}});
+        }})()
+        """
+        try:
+            dom_result = json.loads(self._evaluate(target_id, dom_js))
+            dom_values = dom_result.get("domValues", [])
+            if dom_values:
+                results["values"].extend(dom_values)
+                results["sources"].append("dom")
+        except Exception:
+            pass
+
+        # ---- 策略2：REST API fetch（在页面上下文执行，自动带 cookie）----
+        if api_url:
+            fetch_js = f"""
+            (() => {{
+                return fetch({json.dumps(api_url)})
+                    .then(r => r.json())
+                    .then(d => JSON.stringify(d))
+                    .catch(e => JSON.stringify({{error: e.message}}));
+            }})()
+            """
+            try:
+                resp = self.page_call(target_id, "Runtime.evaluate", {
+                    "expression": fetch_js,
+                    "returnByValue": True,
+                    "awaitPromise": True,
+                })
+                raw = resp.get("result", {}).get("value", "")
+                if raw:
+                    api_data = json.loads(raw)
+                    # api_data 可能是 list（Flink metrics）或 dict
+                    has_error = isinstance(api_data, dict) and api_data.get("error")
+                    if not has_error:
+                        results["api_data"] = api_data
+                        results["sources"].append("rest_api")
+                        # 提取 value 字段
+                        items = api_data if isinstance(api_data, list) else [api_data]
+                        for item in items:
+                            if isinstance(item, dict):
+                                v = item.get("value")
+                                if v is not None:
+                                    results["values"].append(str(v))
+            except Exception as exc:
+                results["api_error"] = str(exc)
+
+        if not results["values"] and "api_data" not in results:
+            results["warning"] = "no metric values found; try --api <rest_url> or check chart is loaded"
+
+        return results
+
+    def eval_js(        self,
+        expression: str,
+        await_promise: bool = False,
+        target: str = "active",
+    ) -> dict:
+        """在页面上下文执行 JS 表达式并返回结果。
+
+        :param expression: JavaScript 表达式或语句
+        :param await_promise: 若表达式返回 Promise，是否等待它 resolve
+        :return: {"ok": True, "result": <value>, "type": <str>}
+        """
+        target_id = self.resolve_target(target)
+        resp = self.page_call(target_id, "Runtime.evaluate", {
+            "expression": expression,
+            "returnByValue": True,
+            "awaitPromise": await_promise,
+        })
+        result = resp.get("result", {})
+        exc = resp.get("exceptionDetails")
+        if exc:
+            msg = exc.get("exception", {}).get("description") or exc.get("text", "JS error")
+            return {"ok": False, "error": msg}
+        val = result.get("value")
+        typ = result.get("type", "")
+        return {"ok": True, "result": val, "type": typ}
+
+    def capture_headers(
+        self,
+        url_filter: str = "",
+        wait_sec: float = 10,
+        target: str = "active",
+    ) -> dict:
+        """临时开启网络捕获，等待 wait_sec 秒后停止，返回匹配请求的 headers。
+
+        :param url_filter: URL 关键字过滤（空则返回所有）
+        :param wait_sec: 等待时间（秒）
+        :return: {"ok": True, "requests": [{"url", "method", "headers"}, ...]}
+        """
+        import time as _time
+        self.network_capture_start(target=target)
+        _time.sleep(wait_sec)
+        stop_result = self.network_capture_stop(target=target, get_body=False)
+        if not stop_result.get("ok"):
+            return stop_result
+        all_reqs = stop_result.get("requests", [])
+        if url_filter:
+            all_reqs = [r for r in all_reqs if url_filter.lower() in r.get("url", "").lower()]
+        result_list = []
+        for r in all_reqs:
+            result_list.append({
+                "url": r.get("url", ""),
+                "method": r.get("method", "GET"),
+                "status": r.get("status", "?"),
+                "headers": r.get("headers", {}),
+            })
+        return {"ok": True, "requests": result_list, "count": len(result_list)}
+
+    def scan_shortcuts(self, target: str = "active") -> dict:
+        """扫描页面中可见的键盘快捷键提示。
+
+        扫描策略：
+        1. 读取所有元素的 title / aria-label / data-tooltip / data-hotkey 属性
+        2. 正则匹配包含快捷键模式的文本（Ctrl+X、Cmd+S、⌘S、⌥K 等）
+        3. 返回去重后的 [{text, key_hint, tag, selector}] 列表
+
+        :return: {"ok": True, "shortcuts": [...], "count": N}
+        """
+        target_id = self.resolve_target(target)
+        js = r"""
+        (() => {
+            const KEY_RE = /(?:Ctrl|Cmd|Meta|Alt|Shift|Option|⌘|⌥|⌃|⇧)[+\s]?\w+|(?:\w+\s+)?(?:⌘|⌥|⌃|⇧)\w+/i;
+            const ATTRS = ['title', 'aria-label', 'data-tooltip', 'data-hotkey', 'data-title', 'placeholder'];
+            const results = [];
+            const seen = new Set();
+            for (const el of document.querySelectorAll('*')) {
+                for (const attr of ATTRS) {
+                    const val = el.getAttribute(attr);
+                    if (!val) continue;
+                    const m = val.match(KEY_RE);
+                    if (!m) continue;
+                    const key_hint = m[0];
+                    const full_text = val.trim();
+                    const dedup = key_hint + '||' + el.tagName;
+                    if (seen.has(dedup)) continue;
+                    seen.add(dedup);
+                    // 构建简单选择器
+                    let sel = el.tagName.toLowerCase();
+                    if (el.id) sel += '#' + el.id;
+                    else if (el.className && typeof el.className === 'string') {
+                        const cls = el.className.trim().split(/\s+/)[0];
+                        if (cls) sel += '.' + cls;
+                    }
+                    results.push({
+                        text: full_text,
+                        key_hint: key_hint,
+                        tag: el.tagName.toLowerCase(),
+                        attr: attr,
+                        selector: sel,
+                    });
+                }
+            }
+            return JSON.stringify(results);
+        })()
+        """
+        raw = self._evaluate(target_id, js)
+        try:
+            shortcuts = json.loads(raw) if isinstance(raw, str) else raw
+        except Exception:
+            shortcuts = []
+        return {"ok": True, "shortcuts": shortcuts or [], "count": len(shortcuts or [])}
+
+    @staticmethod
+    def _export_python_client(requests: list[dict], daemon_script: str = "") -> str:
+        """导出为完整可直接运行的 Python 客户端代码。
+
+        与 _export_python 的区别：
+        - 自动生成 get_cookies() 调用获取实时 cookie
+        - 自动注入 uid / csrf-token 等非标 header 的获取示意
+        - 生成完整可运行的 requests.Session 客户端
+        """
+        # 从第一个请求推断页面 URL 用于 cookies
+        first_url = requests[0].get("url", "") if requests else ""
+        from urllib.parse import urlparse
+        parsed = urlparse(first_url)
+        base_url = f"{parsed.scheme}://{parsed.netloc}" if parsed.netloc else "<BASE_URL>"
+
+        daemon = daemon_script or "$DAEMON $SCRIPT"
+
+        # 收集所有出现的非标准 header（在所有请求中）
+        all_non_std = set()
+        STD_SKIP = {
+            "host", "connection", "content-length", "accept-encoding", "accept-language",
+            "accept", "user-agent", "origin", "referer", "cache-control", "pragma",
+            "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+            "sec-fetch-dest", "sec-fetch-mode", "sec-fetch-site",
+            "upgrade-insecure-requests", "content-type",
+        }
+        for req in requests:
+            for k in req.get("headers", {}):
+                if k.lower() not in STD_SKIP:
+                    all_non_std.add(k)
+
+        lines = [
+            '"""',
+            '自动生成的 API 客户端（由 CDP network-capture export --python-client 生成）',
+            '',
+            '运行前需要：',
+            '  1. Chrome CDP daemon 正在运行',
+            '  2. 浏览器已登录目标站点；脚本通过 cdp_client SDK 获取实时 cookie',
+            '"""',
+            '',
+            'import json',
+            'import sys',
+            'import warnings',
+            'from pathlib import Path',
+            'import requests',
+            'import urllib3',
+            '',
+            '# ---------- SSL 处理（内网自签证书场景）----------',
+            '# 如果服务器使用公网受信证书，可将下面两行注释掉',
+            'warnings.filterwarnings("ignore", category=urllib3.exceptions.InsecureRequestWarning)',
+            'VERIFY_SSL = False  # 改为 True 或 CA 证书路径以启用验证',
+            '',
+            '# ---------- 获取实时 Cookie ----------',
+            f'DAEMON_SCRIPT = "{daemon_script or "/path/to/daemon.py"}"',
+            f'TARGET_URL = "{base_url}"',
+            'CDP_DAEMON_SCRIPTS = str(Path(DAEMON_SCRIPT).resolve().parent)',
+            'if CDP_DAEMON_SCRIPTS not in sys.path:',
+            '    sys.path.insert(0, CDP_DAEMON_SCRIPTS)',
+            'from cdp_client import get_auth_material, get_cookies, get_storage, request_auth_token',
+            '',
+            'live_cookies = get_cookies(TARGET_URL)',
+            '',
+            '# ---------- 构建 Session ----------',
+            'session = requests.Session()',
+            'session.verify = VERIFY_SSL  # SSL 证书验证（内网场景通常需要 False）',
+            'session.cookies.update(live_cookies)',
+            '',
+        ]
+
+        # 如果有 uid / csrf-token 等非标 header，给出示例
+        if all_non_std:
+            lines += [
+                '# ---------- 非标认证 Header（从抓包自动提取，请按需更新） ----------',
+                '# 以下 header 在原始请求中出现，可能需要动态获取（如 csrf-token 每次页面加载都变）',
+                '# 如需 cookie 换 token，可用 request_auth_token(url, method="POST", extract="data.token")',
+                '# 如 token 存在 storage，可用 get_storage("token", storage="local" 或 "session")',
+            ]
+            # 取第一个有这些 header 的请求作为示例值
+            example_vals: dict[str, str] = {}
+            for req in requests:
+                for k in all_non_std:
+                    if k not in example_vals and k in req.get("headers", {}):
+                        example_vals[k] = req["headers"][k]
+            for k in sorted(all_non_std):
+                val = example_vals.get(k, "<value>")
+                lines.append(f'COMMON_HEADERS_{k.upper().replace("-","_")} = {json.dumps(val)}  # 示例值，需动态更新')
+            lines += [
+                '',
+                '# csrf-token 可从页面 meta 标签动态获取（如适用）：',
+                '# from cdp_client import page_call',
+                '# meta_val = page_call("active", "Runtime.evaluate", {',
+                '#     "expression": \'document.querySelector("meta[name=csrf-token]")?.content\',',
+                '#     "returnByValue": True,',
+                '# }).get("result", {}).get("value", "")',
+                '',
+            ]
+            # 构建通用 headers 字典
+            common_h: dict[str, str] = {}
+            for req in requests:
+                for k in all_non_std:
+                    if k not in common_h and k in req.get("headers", {}):
+                        common_h[k] = req["headers"][k]
+            lines.append(f'COMMON_HEADERS = {json.dumps(common_h, indent=4, ensure_ascii=False)}')
+            lines.append('')
+
+        # 各请求
+        for i, req in enumerate(requests):
+            method = req.get("method", "GET").upper()
+            url = req.get("url", "")
+            headers = req.get("headers", {})
+            post_data = req.get("postData")
+            status = req.get("status", "?")
+            body_preview = req.get("responseBody", "")
+
+            lines.append(f"# ══════════════════════════════════════════════")
+            lines.append(f"# [{i+1}] {method} {url}")
+            lines.append(f"# 响应状态: {status}")
+            if body_preview:
+                preview = str(body_preview)[:200].replace("\n", " ")
+                lines.append(f"# 响应预览: {preview}")
+
+            # 仅保留非标准 header（标准的由 session 自动处理）
+            req_specific = {k: v for k, v in headers.items() if k.lower() not in STD_SKIP}
+            if all_non_std and req_specific:
+                # 去除通用 header，只留该请求特有的
+                extra = {k: v for k, v in req_specific.items() if k in all_non_std}
+                unique = {k: v for k, v in req_specific.items() if k not in all_non_std}
+                h_expr = "COMMON_HEADERS" if all_non_std else "{}"
+                if unique:
+                    lines.append(f"headers_{i+1} = {{**COMMON_HEADERS, **{json.dumps(unique, ensure_ascii=False)}}}")
+                else:
+                    lines.append(f"headers_{i+1} = COMMON_HEADERS")
+            else:
+                lines.append(f"headers_{i+1} = {json.dumps(req_specific, indent=4, ensure_ascii=False)}")
+
+            if method in ("POST", "PUT", "PATCH") and post_data:
+                content_type = headers.get("Content-Type", headers.get("content-type", ""))
+                if "application/json" in content_type:
+                    try:
+                        body = json.loads(post_data)
+                        lines.append(f"body_{i+1} = {json.dumps(body, indent=4, ensure_ascii=False)}")
+                        lines.append(
+                            f"resp_{i+1} = session.{method.lower()}("
+                            f"\n    {json.dumps(url)},"
+                            f"\n    headers=headers_{i+1},"
+                            f"\n    json=body_{i+1},"
+                            f"\n)"
+                        )
+                    except json.JSONDecodeError:
+                        lines.append(f"data_{i+1} = {json.dumps(post_data)}")
+                        lines.append(
+                            f"resp_{i+1} = session.{method.lower()}("
+                            f"\n    {json.dumps(url)},"
+                            f"\n    headers=headers_{i+1},"
+                            f"\n    data=data_{i+1},"
+                            f"\n)"
+                        )
+                else:
+                    lines.append(f"data_{i+1} = {json.dumps(post_data)}")
+                    lines.append(
+                        f"resp_{i+1} = session.{method.lower()}("
+                        f"\n    {json.dumps(url)},"
+                        f"\n    headers=headers_{i+1},"
+                        f"\n    data=data_{i+1},"
+                        f"\n)"
+                    )
+            else:
+                lines.append(
+                    f"resp_{i+1} = session.{method.lower()}("
+                    f"\n    {json.dumps(url)},"
+                    f"\n    headers=headers_{i+1},"
+                    f"\n)"
+                )
+            lines.append(f"print(f'[{i+1}] {{resp_{i+1}.status_code}} {method} {url[:80]}')")
+            lines.append(f"assert resp_{i+1}.ok, f'FAILED: {{resp_{i+1}.status_code}} {{resp_{i+1}.text[:200]}}'")
+            lines.append("")
+
+        lines += [
+            "print('All requests succeeded!')",
+            "",
+        ]
+        return "\n".join(lines)
+
     @staticmethod
     def _export_curl(requests: list[dict]) -> str:
         """导出为 curl 命令。"""
@@ -2963,6 +5181,14 @@ class PageManager:
         """
         try:
             target = req.get("target", "active")
+            if action in self._MUTATING_TARGET_ACTIONS and isinstance(target, str) and target.startswith("url:"):
+                return {
+                    "ok": False,
+                    "error": "mutating actions do not allow url: target; use tab:alias, active, or exact targetId",
+                }
+
+            if action == "target_resolve":
+                return self.resolve_target_info(target)
 
             if action == "page_call":
                 method = req.get("method", "")
@@ -2973,11 +5199,36 @@ class PageManager:
                 return {"ok": True, "result": result, "target_id": target_id}
 
             elif action == "snapshot":
+                with_tooltips = req.get("with_tooltips", False)
                 result = self.snapshot(
                     target=target,
                     scope=req.get("scope"),
                     include_cursor=req.get("include_cursor", False),
+                    compact=req.get("compact", False),
+                    depth=req.get("depth"),
+                    include_urls=req.get("include_urls", False),
                 )
+                # -T / --with-tooltips：对无描述的小型元素补全 tooltip
+                if with_tooltips and result.get("elements"):
+                    try:
+                        tooltip_result = self.scan_tooltips(target=target)
+                        tooltips_by_pos = {
+                            (b["x"], b["y"]): b.get("tooltip", "")
+                            for b in tooltip_result.get("buttons", [])
+                            if b.get("tooltip")
+                        }
+                        for el in result["elements"]:
+                            if not el.get("desc") or len(el.get("desc", "")) < 2:
+                                x, y = el.get("x", 0), el.get("y", 0)
+                                # 找最近的 tooltip（±15px 容差）
+                                for (tx, ty), tip in tooltips_by_pos.items():
+                                    if abs(tx - x) <= 15 and abs(ty - y) <= 15:
+                                        el["desc"] = tip
+                                        el["desc_src"] = "tooltip"
+                                        break
+                        result["with_tooltips"] = True
+                    except Exception:
+                        pass
                 return {"ok": True, **result}
 
             elif action == "click":
@@ -2992,14 +5243,53 @@ class PageManager:
                     dblclick=req.get("dblclick", False),
                     right=req.get("right", False),
                     at=at,
+                    force_js=req.get("force_js", False),
                 )
                 return {"ok": True, **result}
 
             elif action == "fill":
                 ref = req.get("ref", "")
                 text = req.get("text", "")
+                at_raw = req.get("at")
+                if not ref and not at_raw:
+                    return {"ok": False, "error": "missing 'ref' or 'at'"}
+                # 支持 --at 坐标：先 CDP 鼠标点击该坐标聚焦，再 fill
+                if at_raw and len(at_raw) == 2 and (not ref or ref in ("__dummy__", "dummy")):
+                    x, y = int(at_raw[0]), int(at_raw[1])
+                    tid = self.resolve_target(target)
+                    # 点击坐标聚焦
+                    self._cdp_mouse_click(tid, x, y)
+                    import time as _time; _time.sleep(0.15)
+                    # 找当前聚焦的 input
+                    focused_sel = self._evaluate(tid, """
+                        (() => {
+                            var el = document.activeElement;
+                            if (!el || (el.tagName !== 'INPUT' && el.tagName !== 'TEXTAREA'
+                                        && el.contentEditable !== 'true')) return '';
+                            return el.tagName.toLowerCase() + (el.id ? '#' + CSS.escape(el.id) : '');
+                        })()
+                    """)
+                    if focused_sel:
+                        ref = focused_sel
+                    else:
+                        # 兜底：找坐标最近的 input
+                        ref = self._evaluate(tid, f"""
+                            (() => {{
+                                var els = [...document.querySelectorAll('input,textarea,[contenteditable]')];
+                                var best = null, bestDist = 9999;
+                                for (var el of els) {{
+                                    var r = el.getBoundingClientRect();
+                                    if (r.width === 0) continue;
+                                    var cx = r.left + r.width/2, cy = r.top + r.height/2;
+                                    var d = Math.abs(cx - {x}) + Math.abs(cy - {y});
+                                    if (d < bestDist) {{ bestDist = d; best = el; }}
+                                }}
+                                if (!best) return '';
+                                return best.tagName.toLowerCase() + (best.id ? '#' + CSS.escape(best.id) : '');
+                            }})()
+                        """)
                 if not ref:
-                    return {"ok": False, "error": "missing 'ref'"}
+                    return {"ok": False, "error": "fill: could not locate input at given coordinates"}
                 result = self.fill(
                     ref, text,
                     clear=req.get("clear", True),
@@ -3017,6 +5307,7 @@ class PageManager:
                 result = self.select(
                     ref, value,
                     by_label=req.get("by_label", False),
+                    search_text=req.get("search_text"),
                     target=target,
                 )
                 return {"ok": True, **result}
@@ -3098,6 +5389,22 @@ class PageManager:
                 title = self.get_title(target=target)
                 return {"ok": True, "title": title}
 
+            elif action == "screenshot":
+                return self.screenshot(
+                    target=target,
+                    path=req.get("path", ""),
+                    annotate=req.get("annotate", False),
+                    full_page=req.get("full_page", False),
+                )
+
+            elif action == "diagnose_page":
+                return self.diagnose_page(
+                    target=target,
+                    path=req.get("path", ""),
+                    full_page=req.get("full_page", False),
+                    wait_ms=int(req.get("wait_ms", 0) or 0),
+                )
+
             elif action == "activate":
                 result = self.activate(target=target)
                 return result
@@ -3111,12 +5418,35 @@ class PageManager:
                     wait_ms=req.get("wait_ms", 3000),
                     activate=req.get("activate", True),
                     group=req.get("group", ""),
+                    requested_group=req.get("requested_group", ""),
+                    alias=req.get("alias", ""),
                 )
                 return result
 
             elif action == "close_tab":
                 result = self.close_tab(target=target)
                 return result
+
+            elif action == "tab_bind":
+                name = req.get("name", "")
+                if not name:
+                    return {"ok": False, "error": "missing 'name'"}
+                return self.bind_tab(name, target=target)
+
+            elif action == "tab_get":
+                name = req.get("name", "")
+                if not name:
+                    return {"ok": False, "error": "missing 'name'"}
+                return self.get_tab_binding(name)
+
+            elif action == "tab_list":
+                return self.list_tab_bindings()
+
+            elif action == "tab_remove":
+                name = req.get("name", "")
+                if not name:
+                    return {"ok": False, "error": "missing 'name'"}
+                return self.remove_tab_binding(name)
 
             elif action == "group_create":
                 name = req.get("name", "")
@@ -3253,11 +5583,35 @@ class PageManager:
                 )
                 return result
 
+            elif action == "navigate_page":
+                return self.navigate_page(
+                    target=target,
+                    url=req.get("url"),
+                    reload=bool(req.get("reload", False)),
+                )
+
+            elif action == "reload_page":
+                return self.navigate_page(target=target, reload=True)
+
             elif action == "network_capture_stop":
                 result = self.network_capture_stop(
                     target=target,
-                    get_body=req.get("get_body", False),
+                    get_body=req.get("get_body", True),
+                    wait_ms=int(req.get("wait_ms") or 0),
+                    body_mode=str(req.get("body_mode") or ""),
+                    idle_ms=int(req.get("idle_ms") or 0),
+                    max_bodies=int(req.get("max_bodies") or 0),
+                    max_body_bytes=int(req.get("max_body_bytes") or 0),
+                    method_filter=str(req.get("method_filter") or ""),
+                    url_filter=str(req.get("url_filter") or ""),
+                    exclude_domain=str(req.get("exclude_domain") or ""),
+                    status_filter=str(req.get("status_filter") or ""),
+                    until_match=str(req.get("until_match") or ""),
                 )
+                return result
+
+            elif action == "network_capture_peek":
+                result = self.network_capture_peek(target=target)
                 return result
 
             elif action == "network_capture_export":
@@ -3286,6 +5640,61 @@ class PageManager:
                     override_method=req.get("override_method", ""),
                     override_body=req.get("override_body", ""),
                 )
+
+            elif action == "local_storage_get":
+                return self.local_storage_get(
+                    key=req.get("key", ""),
+                    storage=req.get("storage", "local"),
+                    target=target,
+                )
+
+            elif action == "local_storage_set":
+                key = req.get("key", "")
+                value = req.get("value", "")
+                if not key:
+                    return {"ok": False, "error": "missing 'key'"}
+                return self.local_storage_set(
+                    key=key, value=value,
+                    storage=req.get("storage", "local"),
+                    target=target,
+                )
+
+            elif action == "local_storage_remove":
+                key = req.get("key", "")
+                if not key:
+                    return {"ok": False, "error": "missing 'key'"}
+                return self.local_storage_remove(
+                    key=key,
+                    storage=req.get("storage", "local"),
+                    target=target,
+                )
+
+            elif action == "extract_metric":
+                return self.extract_metric(
+                    title=req.get("title", ""),
+                    api_url=req.get("api_url", ""),
+                    target=target,
+                )
+
+            elif action == "eval_js":
+                expression = req.get("expression", "")
+                if not expression:
+                    return {"ok": False, "error": "missing 'expression'"}
+                return self.eval_js(
+                    expression=expression,
+                    await_promise=req.get("await_promise", False),
+                    target=target,
+                )
+
+            elif action == "capture_headers":
+                return self.capture_headers(
+                    url_filter=req.get("url_filter", ""),
+                    wait_sec=req.get("wait_sec", 10),
+                    target=target,
+                )
+
+            elif action == "scan_shortcuts":
+                return self.scan_shortcuts(target=target)
 
             else:
                 return {"ok": False, "error": f"unknown page action: {action}"}

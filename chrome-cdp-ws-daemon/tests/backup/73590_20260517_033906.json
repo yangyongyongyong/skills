@@ -1,0 +1,55 @@
+{
+  "jobBasicInfo": {
+    "areas": "2",
+    "alarmLevel": [
+      1
+    ],
+    "description": "测试",
+    "jobId": "73590",
+    "bizId": "3606",
+    "parentFolderId": "58862",
+    "name": "test1030",
+    "runType": 4,
+    "owner": "hera",
+    "tenantId": "aym000020221123154428066335",
+    "workspaceId": "166"
+  },
+  "jobScheduleInfo": {
+    "auto": 0,
+    "scheduleType": 0,
+    "cron": "0 0 3 * * ?",
+    "repeatRun": false,
+    "failedRetryCount": 3,
+    "failedRetryInterval": 10,
+    "mustEndMinute": 60,
+    "estimatedEndHour": 0,
+    "dependentCycle": 0,
+    "priorityLevel": 2,
+    "upJobs": []
+  },
+  "configs": {
+    "varParams": "#hera.spark.conf=--master yarn --queue ${queue} --driver-memory 4g --executor-memory 4g --executor-cores 1 --num-executors 2 --conf spark.sql.broadcastTimeout=2500 --conf spark.eventLog.enabled=false\n",
+    "resourceParams": {
+      "mainClass": "",
+      "resIdList": []
+    },
+    "otherParams": "hera.spark.conf=${hera.spark.conf}",
+    "transformConfig": {
+      "path": "gs://gcp-ue-big-data/pipline/prod/"
+    },
+    "pythonScript": false
+  },
+  "focusUser": [
+    "Luca"
+  ],
+  "focus": true,
+  "script": "2222_test_cdp_edits",
+  "submitStatus": 0,
+  "alertTableList": [],
+  "aiReviewStatus": 0,
+  "aiReviewStartTime": 0,
+  "aiReviewEndTime": 0,
+  "disableDependency": false,
+  "updateTime": 1778960010649,
+  "authorizedUsers": []
+}
